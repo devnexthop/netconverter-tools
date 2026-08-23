@@ -40,6 +40,11 @@ EXCLUDE_SUFFIXES = (".pyc", ".pyo", ".zip")
 # Vendor bundles always carry core/ — html_common imports core.html_site.
 ALWAYS = ("core",)
 
+# Shipped so the bundle can verify itself. PUBLISHED.md and the portal both tell
+# the recipient to run `python3 scripts/gen_collectors_lock.py --check`; without
+# these two files that instruction is a promise the bundle cannot keep.
+VERIFY_FILES = ("scripts/gen_collectors_lock.py",)
+
 
 def collector_row(key: str):
     for row in COLLECTORS:
@@ -108,8 +113,16 @@ pip install -r {Path(entry).parent}/requirements.txt
 python3 {entry} --help
 ```
 
-Source, changelog, and hash verification:
-https://github.com/netconverter-ai/netconverter-tools
+## Verify this bundle
+
+```bash
+python3 scripts/gen_collectors_lock.py --check
+```
+
+Recomputes every folder hash and exits non-zero on any mismatch. Standard
+library only.
+
+Source and changelog: https://github.com/netconverter-ai/netconverter-tools
 """
 
 
@@ -144,10 +157,25 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     dest = out_dir / f"nc-collector-{key}.zip"
 
+    # The bundle's own lockfile covers only what the bundle contains, so
+    # `--check` inside it compares like with like.
+    shipped = {key} | set(ALWAYS)
+    bundle_lock = json.dumps({
+        "schema": lock["schema"],
+        "collectors": {k: v for k, v in lock["collectors"].items() if k in shipped},
+        "generated_at": lock["generated_at"],
+    }, indent=2, sort_keys=True) + "\n"
+
+    extras = [("README.md", readme), ("collectors.lock.json", bundle_lock)]
+    for rel in VERIFY_FILES:
+        extras.append((rel, (REPO_ROOT / rel).read_text(encoding="utf-8")))
+
     with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        info = zipfile.ZipInfo("README.md", date_time=ZIP_EPOCH)
-        info.external_attr = 0o644 << 16
-        zf.writestr(info, readme)
+        for arc, text in extras:
+            info = zipfile.ZipInfo(arc, date_time=ZIP_EPOCH)
+            info.external_attr = 0o644 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, text)
         for full, arc in files:
             info = zipfile.ZipInfo(arc, date_time=ZIP_EPOCH)
             info.external_attr = 0o644 << 16
@@ -156,7 +184,7 @@ def main() -> int:
 
     size = dest.stat().st_size
     print(f"wrote {dest}")
-    print(f"  {key} {lock['collectors'][key]['version']} · {len(files) + 1} files · {size:,} bytes")
+    print(f"  {key} {lock['collectors'][key]['version']} · {len(files) + len(extras)} files · {size:,} bytes")
     return 0
 
 
