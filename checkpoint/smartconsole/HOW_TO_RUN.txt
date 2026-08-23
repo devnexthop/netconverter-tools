@@ -1,0 +1,87 @@
+================================================================================
+NetConverter — Check Point Collector v1.5.6
+Customer run instructions (read-only)
+================================================================================
+
+WHAT THIS DOES
+  Connects to YOUR Check Point Management Server (SmartCenter / MDS) via the
+  official Management API and exports the full configuration as JSON + a zip.
+  It does NOT change policies, install policy, or write to the database
+  (login is read-only by default).
+
+  v1.5.6 collects HTTPS inspection rulebases (1.5.5) and threat exception
+  rows without sending layer-uid (R81 rejects that parameter).
+  If you already sent a 1.5.4 zip, re-run. 1.5.5 HTTPS data is valid;
+  only threat exceptions need 1.5.6.
+
+WHAT YOU NEED
+  1. Python 3.8+ on the PC that will run the collector
+       Windows: see INSTALL_PYTHON_WINDOWS.md
+       Linux:   see INSTALL_PYTHON_LINUX.md
+  2. Management API enabled on the management server
+  3. A read-only API username + password
+  4. Network reachability from this PC to the management IP on the API port
+     (usually 4434; sometimes 443 — ask your Check Point admin)
+
+--------------------------------------------------------------------------------
+WINDOWS — easiest path
+--------------------------------------------------------------------------------
+  1. Unzip this folder anywhere (e.g. Desktop).
+  2. Double-click:  run_collect.bat
+  3. Answer the prompts (IP, username, password, port).
+  4. Wait until it finishes (large sites with --where-used can take a while).
+  5. Email / upload ONLY:  checkpoint_audit_YYYYMMDD-HHMMSS.zip
+     Do not send your password.
+
+--------------------------------------------------------------------------------
+WINDOWS / LINUX — command line
+--------------------------------------------------------------------------------
+  cd path\to\NetConverter-CheckPoint-Collector-v1.5.6
+
+  pip install -r requirements.txt
+
+  python checkpoint_collect_data.py ^
+      --mgmt-ip YOUR_MGMT_IP ^
+      --username YOUR_API_USER ^
+      --password "YOUR_PASSWORD" ^
+      --port 4434 ^
+      --full-objects ^
+      --where-used ^
+      --verify-export
+
+  Linux tip: use python3 / pip3, and put the command on one line (no ^).
+
+  Multi-Domain (MDS) — one CMA:
+      add  --domain "CMA_NAME"
+
+  Multi-Domain — every CMA:
+      add  --all-domains
+
+  Confirm version first:
+      python checkpoint_collect_data.py --version
+      (must print 1.5.6)
+
+--------------------------------------------------------------------------------
+OUTPUT
+--------------------------------------------------------------------------------
+  run-YYYYMMDD-HHMMSS\                 folder with JSON exports
+  checkpoint_audit_YYYYMMDD-HHMMSS.zip   <-- send THIS to ValeronLabs
+
+--------------------------------------------------------------------------------
+TROUBLESHOOTING
+--------------------------------------------------------------------------------
+  Login failed              Wrong IP / port / user / password
+  python not recognized     Install Python; on Windows try:  py -3 ...
+  Connection timeout        Firewall blocking 4434/443 to management
+  SSL certificate warnings  Expected for self-signed CP certs (script skips verify)
+  Locked-down corporate PC  Run from a jump host/VM that can reach management
+
+--------------------------------------------------------------------------------
+SOURCE / LATEST
+--------------------------------------------------------------------------------
+  GitHub (public): https://github.com/netconverter-ai/netconverter-tools
+  Path: checkpoint/smartconsole/
+  Version in this package: 1.5.6
+  Re-collect after an older zip: CUSTOMER_RECOLLECT.md
+
+Questions: ValeronLabs / NetConverter engagement contact.

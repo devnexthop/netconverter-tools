@@ -1,45 +1,94 @@
-# NetConverter Tools
+# netconverter-collectors
 
-Open-source CLI tools for working with [NetConverter.AI](https://netconverter.ai) — the multi-vendor network configuration translation engine.
+Read-only firewall configuration collection scripts for [NetConverter](https://netconverter.ai).
 
-These scripts help you import, export, and manage converted configurations across firewall management platforms.
+Each **vendor / technology** folder contains a standalone pull script you run **on your network** against the management plane. Output is a bundle you upload into **NetConverter.local** or **netconverter.ai** for browse, audit, diff, and migration.
 
-## Available Tools
+## Layout
 
-| Tool | Description | Status |
-|------|-------------|--------|
-| [FMC Import](fmc-import/) | Push NetConverter FMC JSON output to a Cisco Secure Firewall Management Center via REST API | Stable |
-
-## Quick Start
-
-```bash
-# Clone the repo
-git clone https://github.com/netconverter-ai/netconverter-tools.git
-cd netconverter-tools
-
-# Install dependencies
-pip install requests
-
-# Run the FMC import tool
-python3 fmc-import/fmc_import.py --host 10.1.1.100 --user admin --json converted_output.json
+```
+core/                          shared bundle format + HTML report framework
+checkpoint/smartconsole/       Check Point Management API
+cisco/fmc/                     Cisco Secure Firewall Management Center
+palo/
+  common/                        shared palo_model + HTML chrome
+  firewall/                      standalone PA XML → html_view
+  panorama/                      Panorama export + html_view
+  scm/                           Strata Cloud Manager (scaffold)
+fortinet/fortimanager/         Fortinet FortiManager (JSON-RPC)
 ```
 
-## How It Works
+Future Cisco collectors (e.g. Catalyst Center) would live under `cisco/<technology>/`.
 
-1. **Convert** your firewall config using [NetConverter.AI](https://netconverter.ai) (Quick Convert or API)
-2. **Download** the converted output (FMC JSON, Panorama XML, etc.)
-3. **Import** using the appropriate tool from this repo
+## Collectors
 
-## Requirements
+| Path | Management plane | Status |
+|------|------------------|--------|
+| [checkpoint/smartconsole/](checkpoint/smartconsole/) | SmartConsole / Management API | **Ready** |
+| [palo/panorama/](palo/panorama/) | Palo Alto Panorama (XML API) | **Ready** |
+| [palo/firewall/](palo/firewall/) | Palo Alto firewall XML → HTML | **Ready** (HTML only) |
+| [cisco/fmc/](cisco/fmc/) | Secure Firewall Management Center (REST) | **Ready** |
+| [palo/scm/](palo/scm/) | Palo Alto Strata Cloud Manager | Scaffold |
+| [fortinet/fortimanager/](fortinet/fortimanager/) | FortiManager (JSON-RPC) | **Ready** |
 
-- Python 3.8+
-- `requests` library (`pip install requests`)
-- Network access to your target management platform
+## Two-step workflow (every collector)
 
-## Contributing
+| Step | Script | Output |
+|------|--------|--------|
+| 1. Collect | `*_collect*.py` / `panorama_export.py` | JSON bundle or XML |
+| 2. HTML view | `build_html.py` | `html_view/index.html` — **read-only**, vendor-themed |
 
-Found a bug or have a feature request? Open an issue or submit a PR.
+Themes match **NetConverter.local** (Check Point magenta, Palo orange, FMC blue, Forti red, SCM purple).
+
+## Quick start (Check Point)
+
+```bash
+cd checkpoint/smartconsole
+pip install -r requirements.txt
+python checkpoint_collect_data.py --mgmt-ip MGMT_IP --username API_USER --password 'PASSWORD' --port 4434
+python build_html.py --input run-YYYYMMDD-HHMMSS
+open run-YYYYMMDD-HHMMSS/html_view/index.html
+```
+
+See [checkpoint/smartconsole/README.md](checkpoint/smartconsole/README.md).
+
+## Quick start (Panorama)
+
+```bash
+cd palo/panorama
+pip install requests
+python panorama_export.py --panorama PANORAMA_IP --device-group DG_NAME --api-key YOUR_KEY --output snapshot.xml
+python build_html.py --input snapshot.xml
+open html_view/index.html
+```
+
+See [palo/panorama/README.md](palo/panorama/README.md).
+
+## Shared bundle format
+
+All collectors target a consistent layout: timestamped output folder + `manifest.json` (vendor, version, counts, pull duration). See [core/manifest.py](core/manifest.py).
+
+Download zips from NetConverter.local include the technology folder plus shared `core/`.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
+
+## Versioning
+
+Each collector is versioned independently (see `VERSIONING.md`). Collect and HTML
+for a technology share one `__version__`. The current shipped versions are in
+`collectors.lock.json`. After any change: bump entry + HTML `__version__`, update
+`CHANGELOG.md`, then run `python3 scripts/gen_collectors_lock.py`.
+
+## Related
+
+- [NetConverter.local](https://netconverter.ai/tool/portal.html#tools-downloads) — offline analysis workbench (download)
+- [netconverter.ai](https://netconverter.ai) — cloud migration
+
+## Push tools
+
+Scripts that write converted output back to a management platform. These are
+maintained separately and are not covered by `collectors.lock.json`.
+
+- [`fmc-import/`](fmc-import/)
