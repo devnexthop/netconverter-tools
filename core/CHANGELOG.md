@@ -1,5 +1,22 @@
 # Changelog — shared collector core (`core/`)
 
+## [1.1.1] — 2026-08-21
+
+### Added
+
+- `DESIGN-TOKENS.md` — the canonical token list, and the source of truth when a
+  collector and the appliance disagree on a colour or radius.
+- Long-name token aliases in `html_theme.py` (`--bg-surface`, `--text`,
+  `--success`, …) mapping onto the existing values. Additive only — no visual
+  change to any collector's output.
+
+### Notes
+
+- Decision #9: blue is the product accent, purple is engineering.
+- Shipped in `3eb48ce` but left undocumented here; backfilled 2026-08-23 when
+  the appliance's collector-consistency check flagged the gap. `manifest.py`
+  and `collectors.lock.json` were already at 1.1.1.
+
 ## [1.1.0] — 2026-06-24
 
 ### Added
