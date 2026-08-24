@@ -26,11 +26,11 @@
     },
     "palo": {
       "entry": "palo/panorama/panorama_export.py",
-      "sha256": "cc4d42a705e77ac70deb47f604b33d89e0941e84b877ba5c4cea0f7c69a67885",
+      "sha256": "548ed8ab3a2c91d048bfa5905cca699ffb5175a45a1c4b6cc58c0dc79cd8c8d3",
       "status": "ready",
-      "version": "1.6.1"
+      "version": "1.7.0"
     }
   },
-  "generated_at": "2026-08-23T04:30:43Z",
+  "generated_at": "2026-08-24T15:12:39Z",
   "schema": 1
 }

@@ -89,6 +89,9 @@ seen before.
 Collecting them is a separate manual, live-only step — see
 [HIT-COUNT-COLLECTION.md](HIT-COUNT-COLLECTION.md).
 
+The **full Gaia analogue** (hit counts **plus** RIB/FIB, HA, live interfaces)
+is [LIVE-ATTACH.md](LIVE-ATTACH.md).
+
 ## HTML browser
 
 ```bash
@@ -102,7 +105,7 @@ For **standalone firewall** XML use [../firewall/build_html.py](../firewall/buil
 
 ## Versioning
 
-Collect and HTML share one version (**1.6.1**): `panorama_export.py` and
+Collect and HTML share one version (**1.7.0**): `panorama_export.py` and
 `palo/common/html_version.py`. See [CHANGELOG.md](CHANGELOG.md) and repo
 `VERSIONING.md`.
 
