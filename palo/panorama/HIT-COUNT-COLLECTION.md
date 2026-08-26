@@ -84,6 +84,22 @@ Export one XML response per source per device-group/vsys per rulebase
 filename (e.g. `<DG-NAME>_pre.xml`, `<serial>_vsys1.xml`) so hits can be
 reconciled back to the exact rule they were collected against.
 
+## 2b. What Panorama actually returns (Nossaman 2026-08-24)
+
+The device-group form returned `status=success` for security **and** NAT,
+pre **and** post. Each rule had:
+
+- `rule-state`: `Used` | `Unused` | `Partial`
+- `all-connected`: whether every firewall in the DG reported in
+- `rule-creation-timestamp` / `rule-modification-timestamp`
+
+It did **not** include integer `<hit-count>` packet counters. Treat
+Used/Unused like Check Point unused-rule flags. For packet counts, run the
+vsys form on the NGFW (sections 1b / 2 XML API b) or confirm hit-count is
+enabled on the DG.
+
+Full command list (RIB/FIB/HA/interfaces): [LIVE-ATTACH.md](LIVE-ATTACH.md).
+
 ## 3. What to send back, and what it upgrades
 
 Send back the raw CLI output or XML responses from step 1 or 2, labeled by

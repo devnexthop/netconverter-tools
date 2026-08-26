@@ -2,7 +2,19 @@
 
 All notable changes to the Palo Alto Panorama export bundle (`panorama_export.py`,
 HTML browsers, and shared models). Collect (`panorama_export.py`) and HTML
-(`palo/common/html_version.py`) share version **1.6.1**.
+(`palo/common/html_version.py`) share version **1.7.0**.
+
+## [1.7.0] — 2026-08-23
+
+### Added
+
+- **Firewall view (Check Point parity).** Per-rule `<target>` serials are parsed
+  on security, NAT, and decryption rules. Empty target = every member of the
+  device group (Policy Targets analogue); a non-empty list is Install On.
+  HTML index `firewalls.html` plus `devices/<serial>.html` show only the
+  inherited device-group chain for that box, then filter by target. Sibling
+  device-group local rules stay off the page. Untargeted parent-DG rules still
+  show when `<parent-dg>` is present in the XML.
 
 ## [1.6.1] — 2026-08-22
 

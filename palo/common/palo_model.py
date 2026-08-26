@@ -37,6 +37,51 @@ def join_m(entry: ET.Element, tag: str) -> str:
     return ", ".join(vals) if vals else "any"
 
 
+def parse_rule_target(entry: ET.Element) -> Tuple[List[str], bool]:
+    """Read a Panorama rule <target> block.
+
+    Empty devices list (or missing <target>) means the rule installs on every
+    firewall in the device group — the PAN-OS analogue of Check Point
+    "Policy Targets". A non-empty list is the analogue of Install On.
+    """
+    tgt = entry.find("target")
+    if tgt is None:
+        return [], False
+    serials: List[str] = []
+    devices = tgt.find("devices")
+    if devices is not None:
+        for el in devices.findall("entry"):
+            name = (el.get("name") or "").strip()
+            if name and name not in serials:
+                serials.append(name)
+        for m in devices.findall("member"):
+            name = _text(m)
+            if name and name not in serials:
+                serials.append(name)
+    negate = _text(tgt.find("negate")).lower() in ("yes", "true")
+    return serials, negate
+
+
+def rule_applies_to_serial(rule: dict, serial: str) -> bool:
+    """True when this rule is enforced on `serial` (Install-On analogue)."""
+    serial = (serial or "").strip()
+    if not serial:
+        return False
+    targets = [str(s).strip() for s in (rule.get("target_serials") or []) if str(s).strip()]
+    negate = bool(rule.get("target_negate"))
+    if not targets:
+        return True
+    hit = serial in targets
+    return (not hit) if negate else hit
+
+
+def _stamp_target(row: dict, entry: ET.Element) -> dict:
+    serials, negate = parse_rule_target(entry)
+    row["target_serials"] = serials
+    row["target_negate"] = negate
+    return row
+
+
 def addr_value(entry: ET.Element) -> str:
     for tag in ("ip-netmask", "ip-range", "fqdn", "ip-wildcard"):
         el = entry.find(tag)
@@ -887,7 +932,7 @@ class PaloStandaloneModel:
         }
         if scope:
             row["vsys"] = scope
-        return row
+        return _stamp_target(row, entry)
 
     def _parse_nat_rule(self, entry: ET.Element, scope: str, rulebase: str) -> dict:
         row = {
@@ -903,7 +948,7 @@ class PaloStandaloneModel:
         }
         if scope:
             row["vsys"] = scope
-        return row
+        return _stamp_target(row, entry)
 
     def _load_rulebases(self, parent: ET.Element, scope: str) -> None:
         for rb_type in _RULEBASE_TAGS:
@@ -1220,36 +1265,42 @@ class PaloPanoramaModel:
 
     def _parse_security_rule(self, entry: ET.Element, dg_name: str, rulebase: str) -> dict:
         disabled = _text(entry.find("disabled")).lower() == "yes"
-        return {
-            "name": entry.get("name", ""),
-            "device_group": dg_name,
-            "rulebase": rulebase,
-            "from": join_m(entry, "from"),
-            "to": join_m(entry, "to"),
-            "source": join_m(entry, "source"),
-            "destination": join_m(entry, "destination"),
-            "service": join_m(entry, "service"),
-            "application": join_m(entry, "application"),
-            "action": _text(entry.find("action")),
-            "profiles": _rule_profiles(entry),
-            "schedule": _text(entry.find("schedule")),
-            "tags": join_m(entry, "tag"),
-            "disabled": disabled,
-        }
+        return _stamp_target(
+            {
+                "name": entry.get("name", ""),
+                "device_group": dg_name,
+                "rulebase": rulebase,
+                "from": join_m(entry, "from"),
+                "to": join_m(entry, "to"),
+                "source": join_m(entry, "source"),
+                "destination": join_m(entry, "destination"),
+                "service": join_m(entry, "service"),
+                "application": join_m(entry, "application"),
+                "action": _text(entry.find("action")),
+                "profiles": _rule_profiles(entry),
+                "schedule": _text(entry.find("schedule")),
+                "tags": join_m(entry, "tag"),
+                "disabled": disabled,
+            },
+            entry,
+        )
 
     def _parse_nat_rule(self, entry: ET.Element, dg_name: str, rulebase: str) -> dict:
-        return {
-            "name": entry.get("name", ""),
-            "device_group": dg_name,
-            "rulebase": rulebase,
-            "from": join_m(entry, "from"),
-            "to": join_m(entry, "to"),
-            "source": join_m(entry, "source"),
-            "destination": join_m(entry, "destination"),
-            "service": join_m(entry, "service"),
-            "source_translation": _nat_translation(entry, "source-translation"),
-            "dest_translation": _nat_translation(entry, "destination-translation"),
-        }
+        return _stamp_target(
+            {
+                "name": entry.get("name", ""),
+                "device_group": dg_name,
+                "rulebase": rulebase,
+                "from": join_m(entry, "from"),
+                "to": join_m(entry, "to"),
+                "source": join_m(entry, "source"),
+                "destination": join_m(entry, "destination"),
+                "service": join_m(entry, "service"),
+                "source_translation": _nat_translation(entry, "source-translation"),
+                "dest_translation": _nat_translation(entry, "destination-translation"),
+            },
+            entry,
+        )
 
     def _parse_decrypt_rule(self, entry: ET.Element, dg_name: str, rulebase: str) -> dict:
         disabled = _text(entry.find("disabled")).lower() == "yes"
@@ -1257,19 +1308,22 @@ class PaloPanoramaModel:
         type_el = entry.find("type")
         if type_el is not None and len(type_el):
             dtype = type_el[0].tag
-        return {
-            "name": entry.get("name", ""),
-            "device_group": dg_name,
-            "rulebase": rulebase,
-            "from": join_m(entry, "from"),
-            "to": join_m(entry, "to"),
-            "source": join_m(entry, "source"),
-            "destination": join_m(entry, "destination"),
-            "service": join_m(entry, "service"),
-            "action": _text(entry.find("action")) or dtype or "—",
-            "decrypt_type": dtype,
-            "disabled": disabled,
-        }
+        return _stamp_target(
+            {
+                "name": entry.get("name", ""),
+                "device_group": dg_name,
+                "rulebase": rulebase,
+                "from": join_m(entry, "from"),
+                "to": join_m(entry, "to"),
+                "source": join_m(entry, "source"),
+                "destination": join_m(entry, "destination"),
+                "service": join_m(entry, "service"),
+                "action": _text(entry.find("action")) or dtype or "—",
+                "decrypt_type": dtype,
+                "disabled": disabled,
+            },
+            entry,
+        )
 
     def _load_template_zones(self, root: ET.Element) -> None:
         for tmpl_name, tmpl in _collect_template_entries(root).items():
@@ -1930,6 +1984,84 @@ class PaloPanoramaModel:
 
     def decrypt_for_dg(self, dg_name: str) -> List[dict]:
         return [d for d in self.decrypt_rules if d.get("device_group") == dg_name]
+
+    def dg_chain(self, dg_name: str) -> List[str]:
+        """Outermost ancestor first, then `dg_name`. Stops on missing/cycle."""
+        chain: List[str] = []
+        cur = dg_name or ""
+        seen: Set[str] = set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            chain.append(cur)
+            cur = self._dg_parent.get(cur) or ""
+        chain.reverse()
+        return chain
+
+    def inherited_rules(self, rows: List[dict], dg_name: str) -> List[dict]:
+        """Effective rule order for a device group (shared + ancestors + self).
+
+        Evaluation order matches Panorama:
+          shared pre → ancestor pre (outermost first) → own pre/local
+          → own post → ancestor post (innermost first) → shared post
+
+        Sibling device-group local rules are not included.
+        """
+        chain = self.dg_chain(dg_name)
+
+        def pick(scope: str, rb: str) -> List[dict]:
+            return [r for r in rows if r.get("device_group") == scope and r.get("rulebase") == rb]
+
+        out: List[dict] = []
+        out.extend(pick(SHARED_SCOPE, "pre-rulebase"))
+        for dg in chain:
+            out.extend(pick(dg, "pre-rulebase"))
+            out.extend(pick(dg, "rulebase"))
+        for dg in reversed(chain):
+            out.extend(pick(dg, "post-rulebase"))
+        out.extend(pick(SHARED_SCOPE, "post-rulebase"))
+        return out
+
+    def split_rules_for_serial(
+        self, rows: List[dict], serial: str, dg_name: str
+    ) -> Tuple[List[dict], List[dict]]:
+        inherited = self.inherited_rules(rows, dg_name) if dg_name else []
+        mine = [r for r in inherited if rule_applies_to_serial(r, serial)]
+        other = [r for r in inherited if not rule_applies_to_serial(r, serial)]
+        return mine, other
+
+    def firewall_view_rows(self) -> List[dict]:
+        """One row per managed serial: identity + applicable vs inherited counts."""
+        out: List[dict] = []
+        for d in self.managed_devices:
+            serial = d.get("serial") or ""
+            dg = d.get("device_group") or ""
+            sec_all = self.inherited_rules(self.rules, dg) if dg else []
+            nat_all = self.inherited_rules(self.nat_rules, dg) if dg else []
+            dec_all = self.inherited_rules(self.decrypt_rules, dg) if dg else []
+            sec = [r for r in sec_all if rule_applies_to_serial(r, serial)]
+            nat = [r for r in nat_all if rule_applies_to_serial(r, serial)]
+            dec = [r for r in dec_all if rule_applies_to_serial(r, serial)]
+            out.append(
+                {
+                    "serial": serial,
+                    "hostname": d.get("hostname") or "",
+                    "device_group": dg,
+                    "template_stack": d.get("template_stack") or "",
+                    "model": d.get("model") or "",
+                    "sw_version": d.get("sw_version") or "",
+                    "connected": d.get("connected") or "",
+                    "ha_state": d.get("ha_state") or "",
+                    "ip_address": d.get("ip_address") or "",
+                    "applicable_rules": len(sec),
+                    "inherited_rules": len(sec_all),
+                    "other_rules": len(sec_all) - len(sec),
+                    "applicable_nat": len(nat),
+                    "inherited_nat": len(nat_all),
+                    "applicable_decrypt": len(dec),
+                    "inherited_decrypt": len(dec_all),
+                }
+            )
+        return out
 
     def interfaces_for_template(self, tmpl_name: str) -> List[dict]:
         return [i for i in self.interfaces if i.get("template") == tmpl_name]

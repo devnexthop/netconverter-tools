@@ -424,6 +424,173 @@ def test_palo_panorama_gp_ipsec_profiles_ha_logfwd():
         path.unlink(missing_ok=True)
 
 
+_FW_XML = """<config><panorama/>
+<shared>
+  <pre-rulebase><security><rules>
+    <entry name="shared-pre">
+      <from><member>any</member></from><to><member>any</member></to>
+      <source><member>any</member></source><destination><member>any</member></destination>
+      <application><member>any</member></application><service><member>any</member></service>
+      <action>allow</action>
+    </entry>
+  </rules></security></pre-rulebase>
+</shared>
+<devices><entry name="localhost.localdomain"><device-group>
+  <entry name="Parent">
+    <pre-rulebase><security><rules>
+      <entry name="parent-pre">
+        <from><member>any</member></from><to><member>any</member></to>
+        <source><member>any</member></source><destination><member>any</member></destination>
+        <application><member>any</member></application><service><member>any</member></service>
+        <action>allow</action>
+      </entry>
+    </rules></security></pre-rulebase>
+  </entry>
+  <entry name="Dallas">
+    <parent-dg>Parent</parent-dg>
+    <devices>
+      <entry name="016201002144"/>
+      <entry name="016201008423"/>
+    </devices>
+    <pre-rulebase><security><rules>
+      <entry name="all-in-dg">
+        <from><member>any</member></from><to><member>any</member></to>
+        <source><member>any</member></source><destination><member>any</member></destination>
+        <application><member>any</member></application><service><member>any</member></service>
+        <action>allow</action>
+      </entry>
+      <entry name="only-first">
+        <target><negate>no</negate>
+          <devices><entry name="016201002144"/></devices>
+        </target>
+        <from><member>any</member></from><to><member>any</member></to>
+        <source><member>any</member></source><destination><member>any</member></destination>
+        <application><member>any</member></application><service><member>any</member></service>
+        <action>allow</action>
+      </entry>
+      <entry name="only-second">
+        <target>
+          <devices><entry name="016201008423"/></devices>
+        </target>
+        <from><member>any</member></from><to><member>any</member></to>
+        <source><member>any</member></source><destination><member>any</member></destination>
+        <application><member>any</member></application><service><member>any</member></service>
+        <action>deny</action>
+      </entry>
+    </rules></security></pre-rulebase>
+  </entry>
+  <entry name="Austin">
+    <parent-dg>Parent</parent-dg>
+    <devices><entry name="AUS-ONLY"/></devices>
+    <pre-rulebase><security><rules>
+      <entry name="sibling-only">
+        <from><member>any</member></from><to><member>any</member></to>
+        <source><member>any</member></source><destination><member>any</member></destination>
+        <application><member>any</member></application><service><member>any</member></service>
+        <action>allow</action>
+      </entry>
+    </rules></security></pre-rulebase>
+  </entry>
+</device-group></entry></devices></config>"""
+
+
+def test_rule_target_and_firewall_view():
+    from palo_model import rule_applies_to_serial
+
+    with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as f:
+        f.write(_FW_XML)
+        path = Path(f.name)
+    try:
+        model = PaloPanoramaModel(path)
+        model.load()
+        by_name = {r["name"]: r for r in model.rules if r.get("device_group") == "Dallas"}
+        assert by_name["only-first"]["target_serials"] == ["016201002144"]
+        assert by_name["only-first"]["target_negate"] is False
+        assert by_name["all-in-dg"]["target_serials"] == []
+        assert rule_applies_to_serial(by_name["only-first"], "016201002144") is True
+        assert rule_applies_to_serial(by_name["only-first"], "016201008423") is False
+        assert rule_applies_to_serial(by_name["all-in-dg"], "016201008423") is True
+
+        mine_a, other_a = model.split_rules_for_serial(model.rules, "016201002144", "Dallas")
+        names_a = {r["name"] for r in mine_a}
+        assert "shared-pre" in names_a
+        assert "parent-pre" in names_a
+        assert "all-in-dg" in names_a
+        assert "only-first" in names_a
+        assert "only-second" not in names_a
+        assert "sibling-only" not in names_a
+        assert {r["name"] for r in other_a} == {"only-second"}
+
+        mine_b, _ = model.split_rules_for_serial(model.rules, "016201008423", "Dallas")
+        names_b = {r["name"] for r in mine_b}
+        assert "only-second" in names_b
+        assert "only-first" not in names_b
+        assert "sibling-only" not in names_b
+
+        mine_aus, _ = model.split_rules_for_serial(model.rules, "AUS-ONLY", "Austin")
+        names_aus = {r["name"] for r in mine_aus}
+        assert "sibling-only" in names_aus
+        assert "all-in-dg" not in names_aus
+        assert "parent-pre" in names_aus
+
+        rows = {r["serial"]: r for r in model.firewall_view_rows()}
+        assert rows["016201002144"]["applicable_rules"] == 4  # shared + parent + all-in-dg + only-first
+        assert rows["016201002144"]["inherited_rules"] == 5  # + only-second
+        assert rows["016201008423"]["applicable_rules"] == 4
+        assert len(model.managed_devices) == 3
+    finally:
+        path.unlink(missing_ok=True)
+
+
+# Yesterday's Nossaman running-config pull (not in git). Skip in CI.
+_NOSSAMAN_DIR = Path(
+    "/Users/marcinzgola/Library/CloudStorage/OneDrive-NEXTHOPLLC/"
+    "netconverter-clients/nossaman"
+)
+_NOSSAMAN_XML = next(_NOSSAMAN_DIR.glob("*2125*running*.xml"), Path("/nonexistent"))
+
+
+def test_nossaman_firewall_view_twelve_boxes():
+    """Prove Firewall view on the 12-firewall Nossaman Panorama snapshot.
+
+    This running-config has no <parent-dg> tags (same as the HTML report from
+    yesterday — every DG parent is em-dash). Sibling-site hide is still the
+    product proof: opening AUS must not dump LV / Branch Offices local rules.
+    Parent-DG inheritance is covered by test_rule_target_and_firewall_view.
+    """
+    if not _NOSSAMAN_XML.is_file():
+        print("skip test_nossaman_firewall_view_twelve_boxes (XML not on this machine)")
+        return
+    model = PaloPanoramaModel(_NOSSAMAN_XML)
+    model.load()
+    rows = {r["serial"]: r for r in model.firewall_view_rows()}
+    assert len(rows) == 12, f"expected 12 firewalls, got {len(rows)}"
+    assert len(model.managed_devices) == 12
+
+    aus_serial = "021201005286"
+    assert aus_serial in rows
+    assert rows[aus_serial]["hostname"] == "AUS-PAFW-01"
+    assert rows[aus_serial]["device_group"] == "AUS"
+    mine, other = model.split_rules_for_serial(model.rules, aus_serial, "AUS")
+    mine_names = {r["name"] for r in mine}
+    assert "SilverPeak_Inbound_Rule" in mine_names
+    assert "DomainstoAccessAIOpsforNGFW" in mine_names
+    lv_names = {r["name"] for r in model.rules if r.get("device_group") == "LV"}
+    bo_names = {r["name"] for r in model.rules if r.get("device_group") == "Branch Offices"}
+    assert not (mine_names & lv_names), f"AUS leaked LV rules: {mine_names & lv_names}"
+    assert not (mine_names & bo_names), f"AUS leaked Branch Offices rules: {mine_names & bo_names}"
+    # Targeted rule: only AUS serial; other=[] because AUS has one member.
+    targeted = next(r for r in model.rules if r["name"] == "SilverPeak_Inbound_Rule")
+    assert targeted["target_serials"] == [aus_serial]
+    assert other == []
+
+    # Two LV members share the untargeted 39-rule book.
+    lv = [r for r in rows.values() if r["device_group"] == "LV"]
+    assert len(lv) == 2
+    assert {r["applicable_rules"] for r in lv} == {39}
+    assert {r["inherited_rules"] for r in lv} == {39}
+
+
 if __name__ == "__main__":
     tests = [
         test_dedupe_routes,
@@ -436,6 +603,8 @@ if __name__ == "__main__":
         test_palo_panorama_decrypt_shared_interfaces,
         test_palo_panorama_gp_ipsec_profiles_ha_logfwd,
         test_load_palo_model_dispatch,
+        test_rule_target_and_firewall_view,
+        test_nossaman_firewall_view_twelve_boxes,
     ]
     for fn in tests:
         fn()

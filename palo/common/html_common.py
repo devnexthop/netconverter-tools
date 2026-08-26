@@ -146,6 +146,7 @@ PANORAMA_NAV = [
     ("panorama.html", "Panorama View"),
     ("device-groups.html", "Device Groups"),
     ("devices.html", "Managed Firewalls"),
+    ("firewalls.html", "Firewall view"),
     ("relationships.html", "Relationships"),
     ("group", "Network (templates)"),
     ("templates.html", "Templates"),
@@ -1178,6 +1179,154 @@ def build_routing_pages(site: SiteBuilder, model: PaloPanoramaModel) -> None:
         site.page(rel, tmpl_name, "".join(body), depth=1)
 
 
+def _fw_rule_rows(rules: list[dict], *, extra_scope: bool = True) -> list[str]:
+    rows = []
+    for r in rules:
+        scope = esc(r.get("device_group") or "")
+        rows.append(
+            "<tr>"
+            + (f"<td>{scope}</td>" if extra_scope else "")
+            + f"<td>{esc(r.get('rulebase', ''))}</td><td>{esc(r['name'])}</td>"
+            f"<td>{esc(r.get('from', ''))}</td><td>{esc(r.get('to', ''))}</td>"
+            f"<td>{esc(r.get('source', ''))}</td><td>{esc(r.get('destination', ''))}</td>"
+            f"<td>{esc(r.get('application') or 'any')}</td>"
+            f"<td>{esc(r.get('service', ''))}</td>"
+            f"<td>{action_tag(r.get('action', ''))}</td></tr>"
+        )
+    return rows
+
+
+def _fw_nat_rows(rules: list[dict], *, extra_scope: bool = True) -> list[str]:
+    rows = []
+    for n in rules:
+        scope = esc(n.get("device_group") or "")
+        rows.append(
+            "<tr>"
+            + (f"<td>{scope}</td>" if extra_scope else "")
+            + f"<td>{esc(n.get('rulebase', ''))}</td><td>{esc(n['name'])}</td>"
+            f"<td>{esc(n.get('source', ''))}</td><td>{esc(n.get('destination', ''))}</td>"
+            f"<td class='mono'>{esc(n.get('source_translation') or '—')}</td>"
+            f"<td class='mono'>{esc(n.get('dest_translation') or '—')}</td></tr>"
+        )
+    return rows
+
+
+def build_firewall_pages(site: SiteBuilder, model: "PaloPanoramaModel") -> None:
+    """Per-serial policy pages — Check Point gateway view analogue.
+
+    Each page shows inherited device-group policy (parent pre/post + local)
+    filtered by rule <target> serials. Sibling device-group local rules stay off
+    the page. Untargeted parent-DG rules still show.
+    """
+    fw_rows = model.firewall_view_rows()
+    index_rows = []
+    for fw in fw_rows:
+        serial = fw["serial"]
+        rel = f"devices/{safe_name(serial)}.html"
+        host = fw.get("hostname") or serial
+        index_rows.append(
+            "<tr>"
+            f"<td><a href='{rel}'>{esc(host)}</a></td>"
+            f"<td class='mono'><a href='{rel}'>{esc(serial)}</a></td>"
+            f"<td>{dg_cell(fw.get('device_group') or '')}</td>"
+            f"<td>{stack_link(fw.get('template_stack') or '')}</td>"
+            f"<td>{fw.get('applicable_rules', 0)} / {fw.get('inherited_rules', 0)}</td>"
+            f"<td>{fw.get('applicable_nat', 0)} / {fw.get('inherited_nat', 0)}</td>"
+            f"<td>{esc(fw.get('model') or '—')}</td></tr>"
+        )
+        dg = fw.get("device_group") or ""
+        sec_mine, sec_other = model.split_rules_for_serial(model.rules, serial, dg)
+        nat_mine, nat_other = model.split_rules_for_serial(model.nat_rules, serial, dg)
+        dec_mine, _dec_other = model.split_rules_for_serial(model.decrypt_rules, serial, dg)
+        body = [
+            f'<p class="meta"><a href="../firewalls.html">← Firewall view</a> · '
+            f'<a href="../devices.html">Managed firewalls</a></p>',
+            f"<h2>{esc(host)}</h2>",
+            f'<div class="note"><b>Serial</b>: <span class="mono">{esc(serial)}</span> · '
+            f"<b>Device group</b>: {dg_cell(dg, prefix='../')} · "
+            f"<b>Template stack</b>: {stack_link(fw.get('template_stack') or '', prefix='../')} · "
+            f"<b>Model</b>: {esc(fw.get('model') or '—')}</div>",
+            '<div class="note">Rules below are this firewall\'s <b>effective</b> policy: '
+            "inherited parent-DG pre/post plus local rules, then filtered by rule "
+            "<code>target</code> (empty target = every member of the device group). "
+            "Sibling device-group local rules are not shown.</div>",
+        ]
+        sec_hdr = ["Scope", "Rulebase", "Name", "From", "To", "Source", "Destination", "Application", "Service", "Action"]
+        body.append(
+            f'<h3>Security rules — this firewall '
+            f'<span class="count">({len(sec_mine)} of {len(sec_mine) + len(sec_other)})</span></h3>'
+        )
+        if sec_mine:
+            body.append(site.table("tbl-fw-sec", sec_hdr, _fw_rule_rows(sec_mine)))
+        else:
+            body.append(
+                f'<div class="note warn">No security rules in device-group '
+                f'<b>{esc(dg or "(none)")}</b> apply to this serial via inheritance + target.</div>'
+            )
+        if sec_other:
+            body.append(
+                '<details style="margin-top:16px"><summary class="section-title" style="cursor:pointer">'
+                f'Other targets in this device-group chain '
+                f'<span class="count">({len(sec_other)} rules)</span></summary>'
+                '<div class="note warn">These rules are in the same inherited policy but '
+                f'<code>target</code> lists other serials — not enforced on '
+                f'<span class="mono">{esc(serial)}</span>.</div>'
+            )
+            body.append(site.table("tbl-fw-sec-other", sec_hdr, _fw_rule_rows(sec_other)))
+            body.append("</details>")
+        nat_hdr = ["Scope", "Rulebase", "Name", "Source", "Destination", "Src Xlate", "Dst Xlate"]
+        body.append(
+            f'<h3>NAT — this firewall '
+            f'<span class="count">({len(nat_mine)} of {len(nat_mine) + len(nat_other)})</span></h3>'
+        )
+        if nat_mine:
+            body.append(site.table("tbl-fw-nat", nat_hdr, _fw_nat_rows(nat_mine)))
+        elif nat_other:
+            body.append(
+                f'<div class="note">No NAT rules target {esc(host)} '
+                f"(device-group chain has {len(nat_other)} NAT rule(s) for other serials).</div>"
+            )
+        if nat_other:
+            body.append(
+                '<details><summary class="section-title" style="cursor:pointer">'
+                f'NAT — other targets <span class="count">({len(nat_other)})</span></summary>'
+            )
+            body.append(site.table("tbl-fw-nat-other", nat_hdr, _fw_nat_rows(nat_other)))
+            body.append("</details>")
+        if dec_mine:
+            body.append(f'<h3>Decryption — this firewall <span class="count">({len(dec_mine)})</span></h3>')
+            body.append(
+                site.table(
+                    "tbl-fw-dec",
+                    ["Scope", "Rulebase", "Name", "Type", "Action"],
+                    [
+                        "<tr>"
+                        f"<td>{esc(d.get('device_group') or '')}</td>"
+                        f"<td>{esc(d.get('rulebase', ''))}</td><td>{esc(d['name'])}</td>"
+                        f"<td>{esc(d.get('decrypt_type') or '—')}</td>"
+                        f"<td>{action_tag(d.get('action', ''))}</td></tr>"
+                        for d in dec_mine[:200]
+                    ],
+                )
+            )
+        site.page(rel, host, "".join(body), depth=1)
+
+    table_page(
+        site,
+        "firewalls.html",
+        "Firewall view",
+        ["Hostname", "Serial", "Device group", "Template stack", "Security (this / inherited)",
+         "NAT (this / inherited)", "Model"],
+        index_rows,
+        note=(
+            "One row per managed firewall. <b>This / inherited</b> is rules that apply to "
+            "that serial versus the full inherited device-group chain (parent pre/post + local). "
+            "Sibling device-group local rules are excluded. Same idea as Check Point Firewall view "
+            "(Install On / Policy Targets). Click a row for the rule tables."
+        ),
+    )
+
+
 def build_panorama_site(model: PaloPanoramaModel, out_dir: Path, *, viewer_version: str = "") -> None:
     site = SiteBuilder(out_dir, "palo", model.path.name, PANORAMA_NAV, viewer_version=viewer_version)
     site.write_assets()
@@ -1303,8 +1452,8 @@ def build_panorama_site(model: PaloPanoramaModel, out_dir: Path, *, viewer_versi
         ha_cell = f'<span class="tag {"t-accept" if ha == "active" else "t-other"}">{esc(ha)}</span>' if ha else "—"
         dev_rows.append(
             "<tr>"
-            f"<td>{host_cell}</td>"
-            f"<td class='mono'>{esc(d['serial'])}</td>"
+            f"<td><a href='devices/{safe_name(d['serial'])}.html'>{host_cell}</a></td>"
+            f"<td class='mono'><a href='devices/{safe_name(d['serial'])}.html'>{esc(d['serial'])}</a></td>"
             f"<td>{esc(d.get('model') or '—')}</td>"
             f"<td class='mono'>{esc(d.get('sw_version') or '—')}</td>"
             f"<td>{yes_no_tag(d.get('connected') or '')}</td>"
@@ -1327,7 +1476,9 @@ def build_panorama_site(model: PaloPanoramaModel, out_dir: Path, *, viewer_versi
             "A hostname marked <b>?</b> has no operational value and falls back to the first "
             "site template in the stack. Assigned vsys is the device-group reference; template "
             "vsys is the union of vsys defined in the stack. "
-            "<b>Counting basis:</b> one row per firewall serial Panorama manages."
+            "<b>Counting basis:</b> one row per firewall serial Panorama manages. "
+            "Click a hostname or serial for the <a href='firewalls.html'>Firewall view</a> — "
+            "only rules that land on that box."
         )
     else:
         dev_note = (
@@ -1335,7 +1486,8 @@ def build_panorama_site(model: PaloPanoramaModel, out_dir: Path, *, viewer_versi
             "1.5.0, so model, software version, HA state, connection status and management IP "
             "are unavailable and hostnames are only guessed from the first site template in "
             "each stack. Re-collect with 1.5.0 or newer. "
-            "<b>Counting basis:</b> one row per firewall serial Panorama manages."
+            "<b>Counting basis:</b> one row per firewall serial Panorama manages. "
+            "Click a hostname or serial for the <a href='firewalls.html'>Firewall view</a>."
         )
     table_page(
         site,
@@ -1346,6 +1498,7 @@ def build_panorama_site(model: PaloPanoramaModel, out_dir: Path, *, viewer_versi
         dev_rows,
         note=dev_note,
     )
+    build_firewall_pages(site, model)
 
     rel_rows = [
         "<tr>"
