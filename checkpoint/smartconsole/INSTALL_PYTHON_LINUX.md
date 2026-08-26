@@ -129,7 +129,7 @@ sudo dnf install -y python3-pip
 Adjust the path to where you cloned or copied the repo:
 
 ```bash
-cd /path/to/netconverter-public-repo/checkpoint/smartconsole
+cd /path/to/netconverter-tools/checkpoint/smartconsole
 ls -1 checkpoint_collect_data.py requirements.txt
 ```
 
@@ -155,7 +155,7 @@ Your prompt should show `(.venv)` when the environment is active.
 **Important:** In every **new** terminal session, activate again before collecting:
 
 ```bash
-cd /path/to/netconverter-public-repo/checkpoint/smartconsole
+cd /path/to/netconverter-tools/checkpoint/smartconsole
 source .venv/bin/activate
 ```
 

@@ -36,7 +36,7 @@ Use `py -3` instead of `python` in all commands in CUSTOMER_README.md if needed.
 ## Step 4 — Install script dependencies
 
 ```bat
-cd path\to\netconverter-public-repo\checkpoint\smartconsole
+cd path\to\netconverter-tools\checkpoint\smartconsole
 pip install -r requirements.txt
 ```
 

@@ -20,7 +20,7 @@ Ask your Check Point administrator to confirm:
 Open **Command Prompt** or a terminal, go to this folder, and run:
 
 ```bash
-cd path/to/netconverter-public-repo/checkpoint/smartconsole
+cd path/to/netconverter-tools/checkpoint/smartconsole
 pip install -r requirements.txt
 ```
 
