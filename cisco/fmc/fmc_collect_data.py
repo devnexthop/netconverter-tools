@@ -17,10 +17,12 @@ License: MIT
 
 from __future__ import annotations
 
-__version__ = "2.3.0"
+__version__ = "2.3.3"
 
 import argparse
 import base64
+import copy
+import hashlib
 import json
 import os
 import re
@@ -30,6 +32,16 @@ from datetime import datetime, timedelta, timezone
 from getpass import getpass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qs, urljoin, urlsplit
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+from safe_stdio import configure_stdio, safe_print  # noqa: E402
+
+configure_stdio()
+
+COLLECTOR_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 try:
     import requests
@@ -39,7 +51,7 @@ try:
 except ImportError:
     import subprocess
 
-    print("First run: installing required Python package 'requests' …")
+    safe_print("First run: installing required Python package 'requests' …")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"], stdout=subprocess.DEVNULL)
     import requests
     import urllib3
@@ -66,8 +78,60 @@ RETRY_BACKOFF = 4
 AUTH_MAX_RETRIES = 6   # token endpoint on lab/sandbox FMCs is transiently flaky (401/timeout)
 AUTH_BACKOFF = 5       # seconds, multiplied by attempt number
 PAGE_SIZE = 1000
+MAX_PAGES = 10000
+MAX_ITEMS = 1000000
 TOKEN_VALIDITY_SEC = 30 * 60
 TOKEN_REFRESH_BUFFER_SEC = 5 * 60
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _nonnegative_int(value: Any) -> int:
+    if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value)):
+        raise ValueError("Invalid nonnegative paging integer")
+    return int(value)
+
+
+def _next_offsets(endpoint: str, value: Any) -> list[int]:
+    """FMC can list all future pages; validate them and retain ordered offsets."""
+    if value in (None, [], ""):
+        return []
+    values = value if isinstance(value, list) else [value]
+    if len(values) > MAX_PAGES:
+        raise ValueError("Too many next-page links")
+    base = urlsplit(endpoint)
+    offsets = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("Invalid next-page link")
+        link = urlsplit(urljoin(endpoint, value))
+        if (link.scheme != "https" or link.netloc.lower() != base.netloc.lower()
+                or link.path != base.path or link.username or link.password or link.fragment):
+            raise ValueError("Next page must remain on the same HTTPS origin and endpoint")
+        query = parse_qs(link.query, keep_blank_values=True)
+        if len(query.get("offset", [])) != 1:
+            raise ValueError("Next page needs one explicit offset")
+        offsets.append(_nonnegative_int(query["offset"][0]))
+    if len(set(offsets)) != len(offsets):
+        raise ValueError("Duplicate next-page offsets")
+    return sorted(offsets)
+
+
+def _endpoint_evidence(client: FMCClient, path: str) -> dict:
+    evidence = getattr(client, "endpoint_evidence", {})
+    return evidence.get(path, {}) if isinstance(evidence, dict) else {}
+
+
+def _save_evidence(client: FMCClient, run: Path, snap: dict) -> None:
+    """Separate provenance; native API records above remain untouched."""
+    evidence = {"schema_version": 1, "vendor": "cisco_fmc", "collector": "fmc_collect_data.py",
+                "collector_version": __version__, "collector_sha256": COLLECTOR_SHA256,
+                "domain_id": client.domain_uuid,
+                "endpoints": copy.deepcopy(client.endpoint_evidence)}
+    snap["collection_evidence"] = evidence
+    _safe_json_write(run / "collection-evidence.json", evidence)
+
 
 # (API path under /object/, output filename, snapshot list key)
 OBJECT_EXPORTS: list[tuple[str, str, str]] = [
@@ -316,6 +380,7 @@ class FMCClient:
         self.token_expiry: datetime | None = None
         self.server_version: str | None = None
         self.auth_domains: list[dict[str, str]] = []
+        self.endpoint_evidence: dict[str, dict] = {}
 
     @property
     def config_base(self) -> str:
@@ -334,6 +399,7 @@ class FMCClient:
                     url,
                     headers={"Authorization": f"Basic {creds}"},
                     timeout=60,
+                    allow_redirects=False,
                 )
             except requests.exceptions.RequestException as exc:
                 # timeout / connection reset — the sandbox token endpoint does this; keep trying
@@ -375,6 +441,7 @@ class FMCClient:
                 f"https://{self.host}/api/fmc_platform/v1/info/serverversion",
                 headers={"X-auth-access-token": self.access_token},
                 timeout=30,
+                allow_redirects=False,
             )
             if vr.status_code == 200:
                 items = vr.json().get("items", [{}])
@@ -395,6 +462,7 @@ class FMCClient:
                     "X-auth-refresh-token": self.refresh_token or "",
                 },
                 timeout=60,
+                allow_redirects=False,
             )
             if resp.status_code == 204:
                 self.access_token = resp.headers.get("X-auth-access-token")
@@ -409,25 +477,32 @@ class FMCClient:
 
     def get_json(self, path: str, *, params: dict | None = None, platform: bool = False) -> dict:
         """GET with retries; path is relative to config_base unless platform=True."""
-        self._maybe_refresh()
         if platform:
             url = f"https://{self.host}{path}"
         elif path.startswith("http"):
             url = path
         else:
             url = f"{self.config_base}{path}"
+        origin = urlsplit(f"https://{self.host}")
+        target = urlsplit(url)
+        if (target.scheme != "https" or target.netloc.lower() != origin.netloc.lower()
+                or target.username or target.password or target.fragment):
+            raise ValueError("FMC GET URL must remain on the configured HTTPS origin")
+        self._maybe_refresh()
 
         last_err: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                resp = self.session.get(url, headers=self._headers(), params=params, timeout=120)
+                resp = self.session.get(url, headers=self._headers(), params=params, timeout=120,
+                                        allow_redirects=False)
                 if resp.status_code == 401 and attempt == 1:
                     self.authenticate()
                     continue
                 if resp.status_code == 429:
+                    last_err = RuntimeError("HTTP 429 retries exhausted")
                     time.sleep(RETRY_BACKOFF * attempt)
                     continue
-                if resp.status_code >= 400:
+                if resp.status_code >= 300:
                     return {"_error": resp.status_code, "_body": resp.text[:500]}
                 if not resp.text:
                     return {}
@@ -438,35 +513,138 @@ class FMCClient:
                     time.sleep(RETRY_BACKOFF * attempt)
         raise RuntimeError(f"GET {path} failed: {last_err}")
 
-    def get_all(self, path: str, *, expanded: bool = True, page_size: int = PAGE_SIZE) -> list[dict]:
+    def get_all(self, path: str, *, expanded: bool = True, page_size: int = PAGE_SIZE,
+                platform: bool = False) -> list[dict]:
+        """Collect bounded pages and retain endpoint-level success/failure evidence.
+
+        A short page is not an end marker: follow a validated next offset or
+        continue until the reported total/an explicit empty page proves the end.
+        Native items are never annotated with collector metadata.
+        """
+        if not isinstance(page_size, int) or not 1 <= page_size <= PAGE_SIZE:
+            raise ValueError("FMC page size must be between 1 and 1000")
         items: list[dict] = []
         offset = 0
-        while True:
+        evidence = {"kind": "list", "status": "error", "items_captured": 0,
+                    "reported_total": None, "started_at": _now(), "pages": []}
+        self.endpoint_evidence[path] = evidence
+        seen_pages: set[str] = set()
+        seen_ids: set[tuple[str, str]] = set()
+        failure = ""
+        for _ in range(MAX_PAGES):
             params: dict[str, Any] = {"limit": page_size, "offset": offset}
             if expanded:
                 params["expanded"] = "true"
-            body = self.get_json(path, params=params)
-            if "_error" in body:
-                if offset == 0:
-                    self.log(f"    WARN {path}: HTTP {body['_error']}")
+            page = {"offset": offset, "requested_limit": page_size, "returned_count": 0,
+                    "reported_total": None, "status": "error", "requested_at": _now()}
+            evidence["pages"].append(page)
+            try:
+                body = self.get_json(path, params=params, **({"platform": True} if platform else {}))
+            except Exception as exc:
+                failure = f"Request failed: {type(exc).__name__}"
+                page["error"] = failure
                 break
-            batch = body.get("items") or []
-            if not batch:
+            if not isinstance(body, dict) or "_error" in body:
+                code = body.get("_error") if isinstance(body, dict) else None
+                failure = f"HTTP {code}" if code is not None else "Invalid list response"
+                page["error"] = failure
+                if code is not None:
+                    page["http_status"] = code
                 break
-            items.extend(batch)
             paging = body.get("paging") or {}
-            total = paging.get("count")
-            if len(batch) < page_size:
+            if not isinstance(paging, dict):
+                failure = "Invalid paging metadata"
+                page["error"] = failure
                 break
-            offset += page_size
-            if total is not None and offset >= total:
+            try:
+                total = _nonnegative_int(paging["count"]) if "count" in paging else None
+                returned_offset = _nonnegative_int(paging.get("offset", offset))
+                if returned_offset != offset:
+                    raise ValueError("Response offset differs from requested offset")
+                batch = body.get("items", [] if total == 0 else None)
+                if not isinstance(batch, list) or not all(isinstance(row, dict) for row in batch):
+                    raise ValueError("List response is missing a native items array")
+                page.update({"returned_count": len(batch), "reported_total": total, "status": "success"})
+                if "limit" in paging:
+                    page["reported_limit"] = _nonnegative_int(paging["limit"])
+                known_total = evidence["reported_total"]
+                if total is not None and known_total is not None and total != known_total:
+                    raise ValueError("Reported total changed during pagination; recapture required")
+                if total is not None:
+                    evidence["reported_total"] = total
+                fingerprint = hashlib.sha256(json.dumps(batch, sort_keys=True, allow_nan=False).encode()).hexdigest()
+                keys = [(str(row.get("type", "")).lower(), str(row["id"])) for row in batch if "id" in row]
+                if batch and (fingerprint in seen_pages or any(key in seen_ids for key in keys)):
+                    raise ValueError("Repeated/overlapping page records; recapture required")
+                if len(items) + len(batch) > MAX_ITEMS:
+                    raise ValueError("FMC collection item limit exceeded")
+                items.extend(batch)
+                seen_pages.add(fingerprint)
+                seen_ids.update(keys)
+                endpoint = f"https://{self.host}{path}" if platform else self.config_base + path
+                next_offsets = _next_offsets(endpoint, paging.get("next"))
+                next_offset = next_offsets[0] if next_offsets else None
+                page["next_offsets"] = next_offsets
+                page["next_offset"] = next_offset
+                end = offset + len(batch)
+                known_total = evidence["reported_total"]
+                if known_total is not None and end > known_total:
+                    raise ValueError("Captured rows exceed reported total; recapture required")
+                if next_offset is not None:
+                    if not batch or next_offset != end:
+                        raise ValueError("Next page skips/repeats rows or follows an empty page")
+                    if known_total is not None and end >= known_total:
+                        raise ValueError("Next page conflicts with reported total")
+                    offset = next_offset
+                elif known_total is not None:
+                    if end == known_total:
+                        evidence["status"] = "complete"
+                        break
+                    if not batch:
+                        raise ValueError("Empty page before reported total; capture is incomplete")
+                    offset = end
+                elif not batch or "next" in paging:
+                    evidence["status"] = "complete"
+                    break
+                else:
+                    # With no total or explicit end marker, ask for the next
+                    # offset even if this server returned fewer rows than asked.
+                    offset = end
+            except (ValueError, TypeError) as exc:
+                failure = str(exc)
+                page["error"] = failure
                 break
             time.sleep(0.05)
+        else:
+            failure = "FMC collection page limit exceeded"
+        if failure:
+            evidence["status"] = "partial" if items else "error"
+            evidence["error"] = failure
+            self.log(f"    WARN {path}: {failure} ({len(items)} native rows retained)")
+        evidence.update({"items_captured": len(items), "finished_at": _now(),
+                         "empty": evidence["status"] == "complete" and not items})
         return items
 
+    def capture_record(self, path: str) -> dict:
+        evidence = {"kind": "record", "status": "error", "items_captured": 0,
+                    "reported_total": None, "started_at": _now(), "pages": []}
+        self.endpoint_evidence[path] = evidence
+        try:
+            body = self.get_json(path, params={"expanded": "true"})
+            if not isinstance(body, dict) or "_error" in body or not body.get("id"):
+                evidence["error"] = (f"HTTP {body['_error']}" if isinstance(body, dict) and "_error" in body
+                                     else "Expanded native record is absent")
+                return body if isinstance(body, dict) else {"_error": "invalid_response"}
+            evidence.update(status="complete", items_captured=1)
+            return body
+        except Exception as exc:
+            evidence["error"] = f"Request failed: {type(exc).__name__}"
+            return {"_error": "request_failed"}
+        finally:
+            evidence["finished_at"] = _now()
+
     def list_domains(self) -> list[dict]:
-        body = self.get_json("/api/fmc_platform/v1/info/domain", platform=True)
-        return body.get("items", [])
+        return self.get_all("/api/fmc_platform/v1/info/domain", expanded=False, platform=True)
 
 
 # --- flatten helpers for HTML snapshot rows ---------------------------------
@@ -944,7 +1122,8 @@ def collect_device_details(
         if not did:
             continue
         log(f"  Device detail: {dname} …")
-        detail = client.get_json(f"/devices/devicerecords/{did}", params={"expanded": "true"})
+        device_path = f"/devices/devicerecords/{did}"
+        detail = client.capture_record(device_path)
         if "_error" not in detail and detail.get("id"):
             dev_full = detail
         else:
@@ -954,10 +1133,9 @@ def collect_device_details(
             f"/devices/devicerecords/{did}/physicalinterfaces",
             f"/devices/devicerecords/{did}/fpphysicalinterfaces",
         )
-        route_paths = (
+        ipv4_route_paths = (
             f"/devices/devicerecords/{did}/routing/ipv4staticroutes",
             f"/devices/devicerecords/{did}/routing/staticroutes",
-            f"/devices/devicerecords/{did}/routing/ipv6staticroutes",
         )
         extra_iface_paths = (
             f"/devices/devicerecords/{did}/logicalinterfaces",
@@ -972,21 +1150,26 @@ def collect_device_details(
             if batch:
                 ifaces = batch
                 break
-        if not ifaces:
-            body = client.get_json(f"{iface_paths[0]}", params={"expanded": "true", "limit": 1000})
-            if isinstance(body, dict) and body.get("_error"):
-                errors.append(f"interfaces: HTTP {body['_error']}")
-
-        for path in route_paths:
+        for path in ipv4_route_paths:
             batch = client.get_all(path, expanded=True)
             if batch:
                 routes = batch
                 break
+        # IPv6 is an independent address family, never an IPv4 fallback.
+        routes.extend(client.get_all(
+            f"/devices/devicerecords/{did}/routing/ipv6staticroutes", expanded=True))
 
         for path in extra_iface_paths:
             batch = client.get_all(path, expanded=True)
             if batch:
                 ifaces.extend(batch)
+
+        attempted = (device_path, *iface_paths, *ipv4_route_paths,
+                     f"/devices/devicerecords/{did}/routing/ipv6staticroutes", *extra_iface_paths)
+        device_evidence = {path: copy.deepcopy(_endpoint_evidence(client, path))
+                           for path in attempted if _endpoint_evidence(client, path)}
+        errors.extend(f"{path}: {entry.get('error', entry['status'])}"
+                      for path, entry in device_evidence.items() if entry.get("status") != "complete")
 
         flat_ifaces = [flatten_interface(dname, did, i) for i in ifaces]
         flat_routes = [flatten_route(dname, did, r) for r in routes]
@@ -1019,6 +1202,7 @@ def collect_device_details(
             "interfaces_flat": flat_ifaces,
             "routes_flat": flat_routes,
             "errors": errors,
+            "collection_evidence": device_evidence,
         }
         _safe_json_write(details_dir / f"{safe_slug(dname)}__{did}.json", bundle)
         time.sleep(0.05)
@@ -1082,6 +1266,7 @@ def collect(
     domain_meta: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run full collection; return consolidated snapshot dict."""
+    client.endpoint_evidence = {}
     snap: dict[str, Any] = {
         "host": client.host,
         "server_version": client.server_version,
@@ -1123,6 +1308,14 @@ def collect(
     snap["counts"]["devices"] = len(devices_raw)
     log(f"  {len(devices_raw)} device(s)")
     collect_device_details(client, run, devices_raw, snap, log)
+
+    # Assignments are authoritative even when expanded device records omit ACP
+    # and NAT references. Keep the API array separate; never inject assignments
+    # into native device JSON or bind policy by display name.
+    assignments = client.get_all("/assignment/policyassignments", expanded=True)
+    _safe_json_write(run / "policy-assignments.json", assignments)
+    snap["policy_assignments"] = assignments
+    snap["counts"]["policy_assignments"] = len(assignments)
 
     snap.setdefault("interfaces", [])
     snap.setdefault("routes", [])
@@ -1167,7 +1360,7 @@ def collect(
             for rules_seg in rule_segs:
                 log(f"  Rules ({rules_seg}): {pname} …")
                 rules = client.get_all(f"/policy/{api_seg}/{pid}/{rules_seg}", expanded=True)
-                if rules:
+                if rules or _endpoint_evidence(client, f"/policy/{api_seg}/{pid}/{rules_seg}").get("status") == "complete":
                     pol_rules[rules_seg] = rules
                 time.sleep(0.05)
 
@@ -1196,123 +1389,57 @@ def collect(
                 snap["counts"][snap_rules_key] = len(snap.get(snap_rules_key) or [])
                 log(f"  Total {rules_seg}: {snap['counts'].get(snap_rules_key, 0)}")
 
+    _save_evidence(client, run, snap)
     return snap
 
 
 # --- Completeness self-audit -------------------------------------------------
-# Policy snap-key -> (rule snap-key, rule API segment). These rules are gathered
-# by a per-policy walk; they have no single "total" list endpoint to count.
-POLICY_RULE_KEYS: dict[str, tuple[str, str]] = {
-    "access_policies": ("access_rules", "accessrules"),
-    "nat_policies": ("nat_rules", "natrules"),
-    "prefilter_policies": ("prefilter_rules", "prefilterrules"),
-    "dns_policies": ("dns_rules", "dnsrules"),
-}
-
-
-def _live_count(client, path: str) -> tuple[int | None, str]:
-    """Cheap live total for a list endpoint via paging.count -> (count, error)."""
-    try:
-        d = client.get_json(path, params={"limit": 1})
-    except Exception as exc:  # noqa: BLE001
-        return None, exc.__class__.__name__
-    if isinstance(d, dict) and "_error" in d:
-        return None, f"HTTP {d['_error']}"
-    cnt = (d.get("paging") or {}).get("count") if isinstance(d, dict) else None
-    try:
-        return (int(cnt) if cnt is not None else None), ""
-    except (TypeError, ValueError):
-        return None, ""
-
-
-def _audit_row(obj_type: str, live: int | None, captured: int, err: str, *, note: str = "") -> dict:
-    if err:
-        status = "api_blocked"
-    elif live is None:
-        status = "captured"            # no live total available; trust the captured count
-    elif captured >= live:
-        status = "complete"
-    else:
-        status = "PARTIAL"
-    return {
-        "object_type": obj_type,
-        "live_total": "" if live is None else live,
-        "captured": captured,
-        "status": status,
-        "note": note or (f"endpoint {err}" if err else ""),
-    }
-
-
-def _probe_rule_blocked(client, api_seg: str, rule_seg: str, snap: dict, container_key: str) -> str:
-    """0 rules across >0 policies: genuinely empty, or API-blocked? -> 'blocked'|'empty'|''."""
-    conts = snap.get(container_key) or []
-    pid = next((c.get("id") for c in conts if isinstance(c, dict) and c.get("id")), None)
-    if not pid:
-        return ""
-    try:
-        d = client.get_json(f"/policy/{api_seg}/{pid}/{rule_seg}", params={"limit": 1})
-    except Exception:  # noqa: BLE001
-        return ""
-    if isinstance(d, dict) and "_error" in d:
-        return "blocked" if d["_error"] in (404, 405, 501) else ""
-    return "empty"
-
-
 def audit_completeness(client, snap: dict, log: Callable[[str], None], domain_label: str = "") -> list[dict]:
-    """Reconcile captured object/policy counts against the live FMC paging totals.
+    """Report recorded endpoint evidence, including each policy's actual totals.
 
-    Cheap (limit=1 count probes). Proves the pull captured everything the FMC
-    reports, and explicitly labels anything the API itself blocks (e.g. DNS rule
-    bodies return 404 on some versions) so a 0 is never mistaken for data loss.
+    No second request can overwrite a failed pull with a later successful probe.
+    A total is published only when FMC returned it, never derived from rows kept.
+    NAT family endpoints are separate observations, not additive unique-rule counts.
     """
-    counts = snap.get("counts", {})
-    rows: list[dict] = []
-    log("Completeness audit — reconciling captured counts vs live FMC totals …")
-
-    for api_seg, _fn, key in OBJECT_EXPORTS:
-        captured = int(counts.get(key, len(snap.get(key) or [])))
-        live, err = _live_count(client, f"/object/{api_seg}")
-        rows.append(_audit_row(key, live, captured, err))
-    for api_seg, _fn, key in INVENTORY_EXPORTS:
-        captured = int(counts.get(key, len(snap.get(key) or [])))
-        live, err = _live_count(client, f"/{api_seg}")
-        rows.append(_audit_row(key, live, captured, err))
-
-    for api_seg, _fn, key, _rule_segs in POLICY_EXPORTS:
-        captured = int(counts.get(key, len(snap.get(key) or [])))
-        live, err = _live_count(client, f"/policy/{api_seg}")
-        note = ""
-        if key in POLICY_RULE_KEYS:
-            rk = POLICY_RULE_KEYS[key][0]
-            note = f"{int(counts.get(rk, 0))} rule(s) across {captured} container(s)"
-        rows.append(_audit_row(key, live, captured, err, note=note))
-        if key in POLICY_RULE_KEYS:
-            rk, rule_seg = POLICY_RULE_KEYS[key]
-            rcap = int(counts.get(rk, 0))
-            if rcap == 0 and (live or 0) > 0:
-                probe = _probe_rule_blocked(client, api_seg, rule_seg, snap, key)
-                if probe == "blocked":
-                    rows.append(_audit_row(
-                        rk, None, 0, "HTTP 404",
-                        note="FMC REST does not expose these rule bodies on this version"))
-                else:
-                    rows.append(_audit_row(
-                        rk, rcap, rcap, "", note="no rules (policy containers are empty)"))
-            else:
-                rows.append(_audit_row(rk, rcap, rcap, "", note="captured via per-policy walk"))
-
+    evidence = (snap.get("collection_evidence") or {}).get("endpoints") or {}
+    labels = {f"/object/{segment}": key for segment, _filename, key in OBJECT_EXPORTS}
+    labels.update({f"/{segment}": key for segment, _filename, key in INVENTORY_EXPORTS})
+    labels.update({f"/policy/{segment}": key for segment, _filename, key, _rules in POLICY_EXPORTS})
+    labels.update({"/devices/devicerecords": "devices", "/assignment/policyassignments": "policy_assignments"})
+    rows = []
+    for path in sorted(set(labels) | set(evidence)):
+        entry = evidence.get(path)
+        if not entry:
+            rows.append({"object_type": labels[path], "endpoint": path, "live_total": "",
+                         "captured": 0, "status": "not_collected", "note": "Endpoint not attempted in this capture"})
+            continue
+        total = entry.get("reported_total")
+        captured = entry.get("items_captured", 0)
+        state = entry.get("status")
+        if state == "complete":
+            status = "complete" if total is not None else "captured"
+            note = ("Successful empty endpoint" if entry.get("empty") else "All returned pages retained")
+            if total is None:
+                note += "; FMC did not report an independent total"
+        elif state == "partial":
+            status, note = "PARTIAL", entry.get("error", "Pagination incomplete")
+        else:
+            status, note = "api_error", entry.get("error", "Endpoint success unverified")
+        rows.append({"object_type": labels.get(path, path.rsplit("/", 1)[-1]), "endpoint": path,
+                     "live_total": total if total is not None else "", "captured": captured,
+                     "status": status, "note": f"{path}: {note}"})
     if domain_label:
-        for r in rows:
-            r["domain"] = domain_label
-    n_blocked = sum(1 for r in rows if r["status"] == "api_blocked")
-    n_partial = sum(1 for r in rows if r["status"] == "PARTIAL")
-    log(f"  audit: {len(rows)} types · {n_partial} partial · {n_blocked} API-blocked")
+        for row in rows:
+            row["domain"] = domain_label
+    log(f"  audit: {len(rows)} endpoint areas · "
+        f"{sum(r['status'] == 'PARTIAL' for r in rows)} partial · "
+        f"{sum(r['status'] == 'api_error' for r in rows)} API errors")
     return rows
 
 
 def write_completeness_csv(out_dir: Path, rows: list[dict]) -> Path:
     import csv as _csv
-    cols = ["object_type", "live_total", "captured", "status", "note"]
+    cols = ["object_type", "endpoint", "live_total", "captured", "status", "note"]
     if rows and "domain" in rows[0]:
         cols = ["domain"] + cols
     path = Path(out_dir) / "completeness.csv"
@@ -1353,8 +1480,8 @@ def main() -> int:
 
     def log(msg: str) -> None:
         line = f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}"
-        print(line)
         log_lines.append(line)
+        safe_print(line)
 
     log(BANNER)
     log(f"Host: {host}")
@@ -1437,9 +1564,11 @@ def main() -> int:
         _safe_json_write(run / "fmc_snapshot.json", snap)
 
     duration = round(time.time() - t0, 1)
-    log(f"Done in {duration}s → {run}")
+    try:
+        log(f"Done in {duration}s → {run}")
+    except UnicodeEncodeError:
+        pass
     log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
-
     write_manifest(
         run,
         vendor="cisco_fmc",
@@ -1448,6 +1577,7 @@ def main() -> int:
         host=host,
         extra={
             "server_version": client.server_version,
+            "collector_sha256": COLLECTOR_SHA256,
             "domain_uuid": client.domain_uuid,
             "duration_sec": duration,
             "counts": snap.get("counts", {}),
@@ -1457,7 +1587,8 @@ def main() -> int:
             "completeness": {
                 "types_audited": len(snap.get("completeness", [])),
                 "partial": sum(1 for r in snap.get("completeness", []) if r.get("status") == "PARTIAL"),
-                "api_blocked": sum(1 for r in snap.get("completeness", []) if r.get("status") == "api_blocked"),
+                "api_errors": sum(1 for r in snap.get("completeness", []) if r.get("status") == "api_error"),
+                "not_collected": sum(1 for r in snap.get("completeness", []) if r.get("status") == "not_collected"),
             },
         },
     )

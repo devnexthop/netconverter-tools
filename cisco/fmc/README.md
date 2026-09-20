@@ -1,6 +1,6 @@
 # Cisco Secure Firewall (FMC) — read-only collector
 
-Pulls a **complete, read-only snapshot** of your Cisco Secure Firewall Management
+Pulls a **read-only snapshot with explicit capture coverage** of your Cisco Secure Firewall Management
 Center (FMC) configuration over the REST API, renders a browsable HTML view, and
 packages a single `fmc_audit_*.zip` you upload to **NetConverter** for audit,
 optimization, and migration to Palo Alto / Fortinet.
@@ -12,7 +12,7 @@ It never modifies your FMC.
 
 - Python 3.8+
 - Network reach to the FMC on HTTPS/TCP 443
-- An FMC API user (a **read-only** user is recommended and sufficient)
+- An FMC API user with read access to the requested domains and endpoints
 
 ```bash
 pip install -r requirements.txt   # just: requests
@@ -41,16 +41,19 @@ python package_run.py --input run-YYYYMMDD-HHMMSS   # -> fmc_audit_YYYYMMDD-HHMM
 ./run_collect.sh --host FMC_HOST --user API_USER full
 ```
 
-Windows: `run_collect.bat` (same flags). Lab / self-signed FMC: add `--insecure`.
+Windows: `run_collect.bat` (same flags). The `.bat` helper forces UTF-8 so a
+default Windows console cannot drop `collection.log` / `manifest.json` after a
+successful pull. Lab / self-signed FMC: add `--insecure`.
 
 ## What you get
 
 A timestamped `run-*/` folder containing the raw JSON snapshot, a `manifest.json`
-(vendor, version, counts, duration), `completeness.csv`, `collection.log`, and a
+(vendor, version, counts, duration), `collection-evidence.json`, `policy-assignments.json`,
+`completeness.csv`, `collection.log`, and a
 self-contained `html_view/` site:
 
 - **Dashboard** — inventory / policy / object KPIs (Cisco FMC theme)
-- **Completeness** — live FMC totals vs what was captured, per object & rule type
+- **Completeness** — recorded FMC totals vs retained rows, per endpoint and policy
   (see below)
 - **Managed Devices** — per-device interfaces and static routes
 - **Policies** — access, NAT, prefilter, intrusion, file, DNS (containers + rules,
@@ -60,8 +63,25 @@ self-contained `html_view/` site:
 - **Apps & URLs In Use** — the L7 applications/URLs/categories *actually referenced
   by access rules*, cross-referenced to those rules with catalog risk/type — the
   migration-relevant set for Palo App-ID / Fortinet application-control mapping
-- **Export Excel / CSV** — every table has a one-click button that downloads the
-  table as CSV (opens directly in Excel). No extra software.
+- **Export CSV** — supported tables have a button that downloads the currently
+  filtered rows as CSV (opens directly in Excel). No extra software.
+
+FMC 2.3.3 requires shared core 1.1.2 for HTML CSV controls; distribute the matching
+collector/core bundle. A builder error may leave a partial dashboard on disk and
+must not be reported as a successful HTML build.
+
+`policy-assignments.json` retains the native expanded policy/target array from
+`/assignment/policyassignments`. It is authoritative assignment evidence; device
+records are not rewritten to insert ACP/NAT references.
+
+Each domain's `collection-evidence.json` has schema version 1, collector/version,
+domain ID, and an `endpoints` map keyed by the exact config-relative API path.
+Entries record `status` (`complete`, `partial`, `error`), `items_captured`,
+`reported_total` (null if FMC supplied none), timestamps and individual page
+offsets/counts/errors. Interface and IPv4/IPv6 fallback endpoints remain separate.
+The same evidence is embedded in the domain snapshot. Native JSON is not annotated.
+An empty rule array is saved only after successful complete collection; absent or
+failed capture must not be interpreted as an empty policy.
 
 ### Multi-domain (MDS / multitenancy)
 
@@ -78,27 +98,31 @@ on 401/429/5xx and network errors. If you see `Auth 401 … retry in Ns`, that i
 expected; let it run. A `FAIL` only after all attempts means a real credential
 or access-policy problem.
 
-## Completeness audit (proof you captured everything)
+## Completeness audit and limits
 
-After every collect, the tool re-queries each endpoint's live `paging.count` and
-compares it to what it saved, writing `completeness.csv` and a **Completeness**
-HTML page:
+After every collect, the tool compares saved endpoint evidence and actual reported
+`paging.count` with retained rows, writing `completeness.csv` and a **Completeness**
+HTML page. Rule endpoints are audited per policy; a captured count is never used
+as an independent live total. A later successful probe cannot erase an earlier
+pagination failure.
 
 | Status | Meaning |
 |--------|---------|
-| `complete` | Captured count matches the live FMC total — nothing missing. |
-| `api_blocked` | The FMC REST API does not expose this on your version (e.g. **DNS rule bodies return 404**, SSL/health may 403/404). A documented platform limit, not a collection defect. |
-| `PARTIAL` | Captured fewer than the live total — investigate / re-run. |
+| `complete` | Recorded pagination reached the FMC-reported total. |
+| `captured` | Successful capture, but FMC supplied no independent total. |
+| `api_error` | Request failed; review the recorded HTTP status, permissions, version and endpoint. |
+| `PARTIAL` | Pagination failed, repeated/skipped rows, changed totals, or exceeded bounds. |
+| `not_collected` | Endpoint was not attempted, for example in quick mode. |
 
 Counts also clarify nuances such as NAT: e.g. *81 NAT policy containers, 22 rules*
 — most ASA-migration NAT containers are empty shells, which is normal and not a
 loss.
 
-### Known FMC API limitation
-DNS **policies** are captured, but DNS **rule bodies** are not exposed by the FMC
-REST API on current versions (`/dnspolicies/{id}/dnsrules` → HTTP 404). They will
-show as `api_blocked` in the audit. NAT and access rules — the core of any
-migration — are captured in full.
+Requests returning 403/404 do not establish that the platform lacks a feature.
+Historical captures used the label `api_blocked`; inspect their underlying evidence.
+NAT ordered/auto/manual endpoints overlap and their row counts are not additive.
+Counts do not prove atomic capture, deployment state, inheritance, HA, live routing,
+hit counters or migration equivalence. Those remain separate evidence requirements.
 
 ## Delivery
 

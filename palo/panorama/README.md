@@ -17,8 +17,10 @@ python panorama_export.py --panorama 10.1.1.50 --user admin \
   --running-config --output customer_snapshot.xml
 ```
 
-One request returns the entire running config — complete by construction, and
-far more robust than ~50 per-entry fetches on a slow or unreliable link. Use the
+One request returns the running configuration and is more robust than many
+per-entry fetches on a slow link. Version 1.7.2 preserves and validates the
+device-group hierarchy before removing readonly mirrors; a successful download
+alone does not prove effective device or operational completeness. Use the
 per-entry flags below only when you need to collect *specific* device groups or
 templates, which `--running-config` cannot do.
 
@@ -105,10 +107,46 @@ For **standalone firewall** XML use [../firewall/build_html.py](../firewall/buil
 
 ## Versioning
 
-Collect and HTML share one version (**1.7.0**): `panorama_export.py` and
+Collect and HTML share one version (**1.7.2**): `panorama_export.py` and
 `palo/common/html_version.py`. See [CHANGELOG.md](CHANGELOG.md) and repo
 `VERSIONING.md`.
 
 ## License
 
 MIT
+
+## Hierarchy evidence — 1.7.2
+
+The exporter retains a minimal `nc-device-group-hierarchy` block with every
+authoritatively observed DG identity, parent or explicit root, source configuration
+store, observation time, source-tree hash and collector version. It retains no
+mirrored objects, template bodies or management credentials in that block.
+The original DG configuration and unknown fields remain unchanged.
+
+Running exports preserve this evidence before stripping `readonly`. Per-entry
+exports request `/config/readonly/devices/entry[@name='localhost.localdomain']/device-group`
+with the same `action=get` candidate store used for policy. They do not substitute
+operational running hierarchy if the request is unavailable. Failed, empty,
+conflicting, cyclic or missing-ancestor evidence remains incomplete. Per-entry
+requests are explicitly non-atomic; a fresh authorized capture must verify the
+API shape and collection consistency on the target Panorama. No live device
+verification is claimed by the offline regression tests.
+
+`nc-collection` records capture mode and actual entry/branch audit outcomes.
+Skipped or failed audits are unverified, never successful empty inventories.
+Hierarchy failures, identity-only stubs and known missing entries or branches return
+exit status 3 while preserving the partial capture. Complete ancestry does not
+make explicitly partial native configuration suitable for device preparation.
+A missing parent link does not prove a root. Older stripped captures remain useful
+for read-only inventory, but complete device reports, copies and packages require
+a new 1.7.2 capture or a native full export with its readonly hierarchy. Do not
+merge older hierarchy with newer policy without a separately reviewed reconstruction.
+
+The shared helper accepts native readonly metadata, explicit `parent-dg` elements
+(empty means root), and the versioned collector block. Selected appliance copies
+retain only their ancestor chain, including explicit root and capture provenance.
+
+The standalone HTML browser applies the same coverage gate: unverified device
+counts show `Unavailable`, device policy tables are suppressed, and optimization
+and unused-object pages explain the missing evidence instead of showing empty
+or apparently complete results. Captured local inventory remains readable.

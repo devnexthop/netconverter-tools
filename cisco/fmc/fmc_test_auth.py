@@ -25,6 +25,14 @@ import time
 import urllib.error
 import urllib.request
 from getpass import getpass
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+from safe_stdio import configure_stdio, safe_print  # noqa: E402
+
+configure_stdio()
 
 
 def normalize_host(host: str) -> str:
@@ -70,33 +78,33 @@ def main() -> int:
             transient = exc.code in (401, 429) or exc.code >= 500
             if transient and attempt < 6:
                 wait = 5 * attempt
-                print(
+                safe_print(
                     f"  auth {exc.code} (often transient on sandbox) — "
                     f"retry in {wait}s ({attempt}/6) …",
                     file=sys.stderr,
                 )
                 time.sleep(wait)
                 continue
-            print(f"FAIL: HTTP {exc.code} — {body}", file=sys.stderr)
+            safe_print(f"FAIL: HTTP {exc.code} — {body}", file=sys.stderr)
             return 1
         except Exception as exc:  # noqa: BLE001
             if attempt < 6:
                 wait = 5 * attempt
-                print(
+                safe_print(
                     f"  auth attempt {attempt}/6 failed ({exc.__class__.__name__}) — "
                     f"retry in {wait}s …",
                     file=sys.stderr,
                 )
                 time.sleep(wait)
                 continue
-            print(f"FAIL: {exc}", file=sys.stderr)
+            safe_print(f"FAIL: {exc}", file=sys.stderr)
             return 1
 
-    print(f"OK: authentication succeeded (HTTP {status})")
-    print(f"Host: {host}")
-    print(f"Domain UUID: {domain or '(not returned)'}")
+    safe_print(f"OK: authentication succeeded (HTTP {status})")
+    safe_print(f"Host: {host}")
+    safe_print(f"Domain UUID: {domain or '(not returned)'}")
     if token:
-        print(f"Token: {token[:24]}…")
+        safe_print(f"Token: {token[:24]}…")
 
     if token:
         vr = urllib.request.Request(
@@ -107,9 +115,9 @@ def main() -> int:
             with urllib.request.urlopen(vr, context=ctx, timeout=30) as vrsp:
                 data = json.loads(vrsp.read())
                 ver = (data.get("items") or [{}])[0].get("serverVersion", "?")
-                print(f"FMC version: {ver}")
+                safe_print(f"FMC version: {ver}")
         except Exception as exc:  # noqa: BLE001
-            print(f"WARN: could not read server version: {exc}")
+            safe_print(f"WARN: could not read server version: {exc}")
 
     return 0
 

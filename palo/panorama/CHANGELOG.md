@@ -2,7 +2,20 @@
 
 All notable changes to the Palo Alto Panorama export bundle (`panorama_export.py`,
 HTML browsers, and shared models). Collect (`panorama_export.py`) and HTML
-(`palo/common/html_version.py`) share version **1.7.0**.
+(`palo/common/html_version.py`) share version **1.7.2**.
+
+## [1.7.2] — 2026-09-06
+
+- Preserve authoritative DG parent and root assertions before stripping readonly mirrors. The same minimal versioned metadata is produced by running-export and candidate per-entry collection, with source/time/hash/version provenance.
+- Keep failed/empty hierarchy and skipped/failed branch audits explicit; partial hierarchy captures exit 3 and remain available for inventory. No flat ancestry is inferred from missing links.
+- Standalone HTML suppresses per-device counts/policy, unused-object findings and optimization when hierarchy is incomplete; inventory remains readable.
+- Shared Palo model reads validated hierarchy metadata. Device preparation validates captured ancestry, preserves its scoped provenance and refuses unknown, conflicting, cyclic or uncaptured ancestor context.
+- Added same-input preservation, partial/error, API-store and immutable-device-metadata regressions. Historical captures were tested read-only; no live Panorama collection or migration approval is implied.
+
+## [1.7.1] — 2026-09-05
+
+- Preserve all source/destination NAT translated-address dependencies in additive reference lists, including dynamic pools. Existing translation display strings are unchanged.
+- Collector and shared HTML version updated to 1.7.1; added synthetic multi-address pool regression coverage.
 
 ## [1.7.0] — 2026-08-23
 

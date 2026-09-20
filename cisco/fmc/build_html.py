@@ -15,7 +15,7 @@ License: MIT
 
 from __future__ import annotations
 
-__version__ = "2.3.0"
+__version__ = "2.3.3"
 
 import argparse
 import hashlib
@@ -24,6 +24,13 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+from safe_stdio import configure_stdio, safe_print  # noqa: E402
+
+configure_stdio()
 
 _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
@@ -1011,8 +1018,9 @@ class FMCReport:
         )
 
     def _detail_script(self, detail_js: dict[str, dict]) -> str:
+        payload = json.dumps(detail_js, ensure_ascii=True).replace("<", "\\u003c")
         return (
-            f"<script>var DETAIL={json.dumps(detail_js, ensure_ascii=False)};</script>"
+            f"<script>var DETAIL={payload};</script>"
             f"<script>{FMC_DETAIL_JS}</script>"
         )
 
@@ -1271,7 +1279,8 @@ class FMCReport:
 
         def status_badge(s: str) -> str:
             cls = {"complete": "b-blue", "captured": "b-blue",
-                   "PARTIAL": "b-red", "api_blocked": "b-amber"}.get(s, "b-blue")
+                   "PARTIAL": "b-red", "api_blocked": "b-amber", "api_error": "b-red",
+                   "not_collected": "b-amber"}.get(s, "b-blue")
             return f'<span class="badge {cls}">{esc(s)}</span>'
 
         has_domain = bool(rows_data[0].get("domain"))
@@ -1291,19 +1300,22 @@ class FMCReport:
             rows.append("<tr>" + "".join(cells) + "</tr>")
 
         n_partial = sum(1 for r in rows_data if r.get("status") == "PARTIAL")
-        n_blocked = sum(1 for r in rows_data if r.get("status") == "api_blocked")
+        n_blocked = sum(1 for r in rows_data if r.get("status") in ("api_blocked", "api_error"))
         n_ok = sum(1 for r in rows_data if r.get("status") in ("complete", "captured"))
         cards = self.site.cards([
             (str(len(rows_data)), "Types audited"),
             (str(n_ok), "Complete", "good"),
             (str(n_partial), "Partial", "bad" if n_partial else ""),
-            (str(n_blocked), "API-blocked", "warn" if n_blocked else ""),
+            (str(n_blocked), "API errors", "warn" if n_blocked else ""),
         ])
         note = (
-            '<div class="note">Live FMC <code>paging.count</code> vs what this pull captured, per '
-            'object/rule type. <b>complete</b> = nothing missing · <b>api_blocked</b> = the FMC REST '
-            'API does not expose it on this version (documented limitation, not a defect) · '
-            '<b>PARTIAL</b> = investigate. Use the export button for the full CSV.</div>'
+            '<div class="note">Reported FMC <code>paging.count</code> vs retained rows, per endpoint. '
+            '<b>complete</b> = recorded pagination reached that total; this does not prove live '
+            'enforcement or atomic capture. <b>captured</b> = successful capture without a reported total. '
+            '<b>api_error</b> / legacy <b>api_blocked</b> = inspect permissions, endpoint and version; '
+            'an HTTP error does not prove the feature is unsupported. <b>PARTIAL</b> = incomplete. '
+            '<b>not_collected</b> = endpoint not attempted. NAT family rows may overlap. '
+            'The CSV button exports the currently filtered rows.</div>'
         )
         body = (
             "<h2>Capture Completeness</h2>"
@@ -1785,16 +1797,16 @@ def main() -> int:
 
     run = Path(args.input)
     if not run.is_dir():
-        print(f"Error: folder not found: {run}")
+        safe_print(f"Error: folder not found: {run}")
         return 1
     snap_path = run / "fmc_snapshot.json"
     if not snap_path.is_file():
-        print(f"Error: fmc_snapshot.json not found in {run}")
+        safe_print(f"Error: fmc_snapshot.json not found in {run}")
         return 1
 
     snap = load_json(snap_path)
     if not isinstance(snap, dict):
-        print("Error: invalid fmc_snapshot.json")
+        safe_print("Error: invalid fmc_snapshot.json")
         return 1
 
     if _has_domain_subdirs(run):
@@ -1804,7 +1816,7 @@ def main() -> int:
 
     out = Path(args.output) if args.output else run / "html_view"
     FMCReport(run, out, snap).build()
-    print(f"Done. Open:\n  {(out / 'index.html').resolve()}")
+    safe_print(f"Done. Open:\n  {(out / 'index.html').resolve()}")
     return 0
 
 

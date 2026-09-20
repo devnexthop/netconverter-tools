@@ -1,5 +1,13 @@
 # Changelog — shared collector core (`core/`)
 
+## [1.1.2] — 2026-09-06
+
+- `SiteBuilder.searchbox` accepts optional `export_csv` and renders the existing
+  filtered-table CSV action with escaped arguments. Existing two-argument callers
+  retain their output. This fixes the FMC 2.3.x HTML builder signature mismatch.
+- `SiteBuilder.page` accepts the FMC object dictionary and generated detail
+  scripts; JSON embedding escapes script-closing text from captured object names.
+
 ## [1.1.1] — 2026-08-21
 
 ### Added

@@ -156,6 +156,20 @@ def _nat_translation(entry: ET.Element, tag: str) -> str:
     return ""
 
 
+def _nat_translation_refs(entry: ET.Element, tag: str) -> List[str]:
+    """All translated address dependencies; retain the separate display summary."""
+    root = entry.find(tag)
+    if root is None:
+        return []
+    out: List[str] = []
+    for address in root.iter("translated-address"):
+        values = [_text(m) for m in address.findall("member")] or [_text(address)]
+        for value in values:
+            if value and value not in out:
+                out.append(value)
+    return out
+
+
 def detect_export_kind(root: ET.Element) -> ExportKind:
     """Classify a PAN-OS XML export as standalone firewall vs Panorama."""
     dg_entries = root.findall(_DG_XPATH)
@@ -206,6 +220,14 @@ def _collect_device_group_entries(root: ET.Element) -> Dict[str, dict]:
                 slot["score"] = score
             if parent:
                 slot["parent"] = parent
+    # The minimal collector metadata replaces readonly without losing its
+    # ancestry. Apply only a fully validated map; never infer links from names.
+    from panorama_hierarchy import hierarchy_coverage
+    evidence = hierarchy_coverage(root)
+    if evidence["complete"]:
+        for name, slot in by_name.items():
+            if name in evidence["parents"]:
+                slot["parent"] = evidence["parents"][name]
     return by_name
 
 
@@ -945,6 +967,8 @@ class PaloStandaloneModel:
             "service": join_m(entry, "service"),
             "source_translation": _nat_translation(entry, "source-translation"),
             "dest_translation": _nat_translation(entry, "destination-translation"),
+            "source_translation_refs": _nat_translation_refs(entry, "source-translation"),
+            "dest_translation_refs": _nat_translation_refs(entry, "destination-translation"),
         }
         if scope:
             row["vsys"] = scope
@@ -1085,6 +1109,8 @@ class PaloPanoramaModel:
         if _text(host_el):
             self.hostname = _text(host_el)
 
+        from panorama_hierarchy import hierarchy_coverage
+        self.hierarchy_coverage = hierarchy_coverage(root)
         dg_map = _collect_device_group_entries(root)
         self.device_groups = sorted(dg_map.keys(), key=str.lower)
 
@@ -1298,6 +1324,8 @@ class PaloPanoramaModel:
                 "service": join_m(entry, "service"),
                 "source_translation": _nat_translation(entry, "source-translation"),
                 "dest_translation": _nat_translation(entry, "destination-translation"),
+                "source_translation_refs": _nat_translation_refs(entry, "source-translation"),
+                "dest_translation_refs": _nat_translation_refs(entry, "destination-translation"),
             },
             entry,
         )
@@ -1963,6 +1991,8 @@ class PaloPanoramaModel:
         self.relationships = rows
 
     def optimization_findings(self) -> List[dict]:
+        if not self.hierarchy_coverage.get("complete"):
+            return []
         findings = _optimization_findings(self.unused, self.rules, self.stats)
         n_disabled = self.stats.get("disabled_rules", 0)
         if n_disabled:
@@ -2006,6 +2036,8 @@ class PaloPanoramaModel:
 
         Sibling device-group local rules are not included.
         """
+        if not self.hierarchy_coverage.get("complete"):
+            raise ValueError("Device-group ancestry is unverified; recollect with Palo collector 1.7.2 or retain native readonly hierarchy")
         chain = self.dg_chain(dg_name)
 
         def pick(scope: str, rb: str) -> List[dict]:
@@ -2035,9 +2067,10 @@ class PaloPanoramaModel:
         for d in self.managed_devices:
             serial = d.get("serial") or ""
             dg = d.get("device_group") or ""
-            sec_all = self.inherited_rules(self.rules, dg) if dg else []
-            nat_all = self.inherited_rules(self.nat_rules, dg) if dg else []
-            dec_all = self.inherited_rules(self.decrypt_rules, dg) if dg else []
+            available = bool(self.hierarchy_coverage.get("complete") and dg)
+            sec_all = self.inherited_rules(self.rules, dg) if available else []
+            nat_all = self.inherited_rules(self.nat_rules, dg) if available else []
+            dec_all = self.inherited_rules(self.decrypt_rules, dg) if available else []
             sec = [r for r in sec_all if rule_applies_to_serial(r, serial)]
             nat = [r for r in nat_all if rule_applies_to_serial(r, serial)]
             dec = [r for r in dec_all if rule_applies_to_serial(r, serial)]
@@ -2052,13 +2085,15 @@ class PaloPanoramaModel:
                     "connected": d.get("connected") or "",
                     "ha_state": d.get("ha_state") or "",
                     "ip_address": d.get("ip_address") or "",
-                    "applicable_rules": len(sec),
-                    "inherited_rules": len(sec_all),
-                    "other_rules": len(sec_all) - len(sec),
-                    "applicable_nat": len(nat),
-                    "inherited_nat": len(nat_all),
-                    "applicable_decrypt": len(dec),
-                    "inherited_decrypt": len(dec_all),
+                    "available": available,
+                    "unavailable_reason": "" if available else "Device-group ancestry or assignment is unverified; recollect with Palo collector 1.7.2 or retain native readonly hierarchy",
+                    "applicable_rules": len(sec) if available else None,
+                    "inherited_rules": len(sec_all) if available else None,
+                    "other_rules": len(sec_all) - len(sec) if available else None,
+                    "applicable_nat": len(nat) if available else None,
+                    "inherited_nat": len(nat_all) if available else None,
+                    "applicable_decrypt": len(dec) if available else None,
+                    "inherited_decrypt": len(dec_all) if available else None,
                 }
             )
         return out

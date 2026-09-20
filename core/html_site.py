@@ -51,12 +51,17 @@ class SiteBuilder:
         (assets / "app.js").write_text(JS, encoding="utf-8")
         self._asset_ver = hashlib.md5((CSS + JS).encode()).hexdigest()[:8]
 
-    def searchbox(self, table_id: str, count_id: str) -> str:
-        return (
+    def searchbox(self, table_id: str, count_id: str, *, export_csv: str | None = None) -> str:
+        search = (
             f'<input class="search" type="search" placeholder="Filter…" '
             f'data-target="{table_id}" data-count="{count_id}" '
             f'oninput="filterTable(this)">'
         )
+        if export_csv:
+            action = "exportTableCSV(" + json.dumps(table_id) + "," + json.dumps(export_csv) + ")"
+            search += (f'<button type="button" class="btn" onclick="{esc(action)}">'
+                       "Export filtered CSV</button>")
+        return search
 
     def cards(self, items: list[tuple[str, str, str]]) -> str:
         """(number, label, optional class warn|bad|good)"""
@@ -140,7 +145,8 @@ class SiteBuilder:
         parts.append("</div>")
         return "".join(parts)
 
-    def page(self, rel_path: str, title: str, body: str, depth: int = 0) -> None:
+    def page(self, rel_path: str, title: str, body: str, depth: int = 0, *,
+             obj_data: dict | None = None, extra_script: str = "") -> None:
         prefix = "../" * depth
         nav = self._nav(prefix, rel_path)
         ver_badge = ""
@@ -149,12 +155,14 @@ class SiteBuilder:
                 f'<div class="viewer-version" title="HTML report builder">'
                 f"v{esc(self.viewer_version)}</div>"
             )
+        objects = ("<script>var OBJ=" + json.dumps(obj_data, ensure_ascii=True).replace("<", "\\u003c")
+                   + ";</script>") if obj_data is not None else ""
         doc = f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{esc(title)} — {esc(self.meta["title_suffix"])}</title>
 <link rel="stylesheet" href="{prefix}assets/style.css?v={self._asset_ver}"></head>
 <body class="{self.meta["theme_class"]}">{ver_badge}<div class="layout">{nav}<div class="main">{body}</div></div>
-<script src="{prefix}assets/app.js?v={self._asset_ver}"></script></body></html>"""
+{objects}<script src="{prefix}assets/app.js?v={self._asset_ver}"></script>{extra_script}</body></html>"""
         full = self.out / rel_path
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(doc, encoding="utf-8")

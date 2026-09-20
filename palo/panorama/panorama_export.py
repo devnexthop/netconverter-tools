@@ -55,16 +55,21 @@ Usage:
 License: MIT
 """
 
-__version__ = "1.7.0"
+__version__ = "1.7.2"
 
 import argparse
 import re
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
+from copy import deepcopy
 from getpass import getpass
 from xml.etree import ElementTree as ET
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
+from panorama_hierarchy import hierarchy_coverage, hierarchy_metadata, preserve_hierarchy
 
 try:
     import requests
@@ -79,6 +84,7 @@ DEVICE_GROUP_PARENT_XPATH = f"{PANORAMA_BASE_XPATH}/device-group"
 TEMPLATE_PARENT_XPATH = f"{PANORAMA_BASE_XPATH}/template"
 TEMPLATE_STACK_PARENT_XPATH = f"{PANORAMA_BASE_XPATH}/template-stack"
 SHARED_XPATH = "/config/shared"
+HIERARCHY_XPATH = "/config/readonly/devices/entry[@name='localhost.localdomain']/device-group"
 
 # Per-branch fetch ceiling. A branch that exists but has nothing configured
 # can hang rather than answering empty (observed live on log-collector-group),
@@ -413,7 +419,8 @@ def fetch_running_config(host, api_key, verify_ssl=True, timeout=300):
     and would have produced a partial snapshot, while this single call succeeded
     first time. One request has one chance to fail; fifty have fifty.
 
-    Two branches are stripped from the result before it is written:
+    Minimal authoritative hierarchy is preserved first. Two branches are then
+    stripped from the result before it is written:
       readonly   — PAN-OS mirrors the whole devices/entry subtree here, which
                    double-counts every device group, template and stack (42/54/24
                    instead of 21/27/12) for any consumer that does not dedupe.
@@ -451,8 +458,13 @@ def fetch_running_config(host, api_key, verify_ssl=True, timeout=300):
     return cfg
 
 
-def strip_branches(cfg, keep_mgt_config=False):
-    """Remove the readonly mirror and (by default) mgt-config. Returns names removed."""
+def strip_branches(cfg, keep_mgt_config=False, config_store="unknown"):
+    """Preserve authoritative ancestry before removing mirrors/admin settings."""
+    coverage = preserve_hierarchy(cfg, source="native-config", config_store=config_store,
+        observed_at=datetime.now(timezone.utc).isoformat())
+    cfg.find("nc-device-group-hierarchy").set("collector-version", __version__)
+    if not coverage["complete"]:
+        print("  INCOMPLETE hierarchy: " + "; ".join(coverage["errors"]))
     removed = []
     for tag in ("readonly",) + (() if keep_mgt_config else ("mgt-config",)):
         for child in list(cfg):
@@ -460,6 +472,44 @@ def strip_branches(cfg, keep_mgt_config=False):
                 cfg.remove(child)
                 removed.append(tag)
     return removed
+
+
+def fetch_hierarchy(host, api_key, verify_ssl=True):
+    """Capture candidate hierarchy using the same action=get store as entries.
+
+    This deliberately does not substitute the operational running hierarchy
+    when the candidate metadata request is unavailable. Multi-request capture
+    remains non-atomic, and failed/empty metadata never asserts a flat estate.
+    """
+    observed = datetime.now(timezone.utc).isoformat()
+    ok, code, response, message = get_with_retry(host, api_key, HIERARCHY_XPATH,
+        verify_ssl, timeout=BRANCH_TIMEOUT_S, retry=False)
+    entries = []
+    if ok and response is not None:
+        result = response.find("./result")
+        if result is not None:
+            entries = list(result.findall("./entry")) or list(result.findall("./device-group/entry"))
+    proxy = ET.Element("config")
+    groups = ET.SubElement(ET.SubElement(ET.SubElement(proxy, "devices"), "entry", {"name": "localhost.localdomain"}), "device-group")
+    readonly = ET.SubElement(ET.SubElement(ET.SubElement(ET.SubElement(proxy, "readonly"), "devices"), "entry", {"name": "localhost.localdomain"}), "device-group")
+    for entry in entries:
+        name = entry.get("name", "")
+        ET.SubElement(groups, "entry", {"name": name})
+        assertion = ET.SubElement(readonly, "entry", {"name": name})
+        for link in entry.findall("parent-dg"):
+            assertion.append(deepcopy(link))
+    coverage = hierarchy_coverage(proxy)
+    if not ok or not entries:
+        coverage["complete"] = False
+        coverage["status"] = "incomplete"
+        coverage["errors"].append("Candidate hierarchy request failed or returned no identities: HTTP " + str(code) + " " + _redact(message)[:160])
+    import hashlib
+    metadata = hierarchy_metadata(coverage, source="candidate-config-api", config_store="candidate",
+        observed_at=observed, source_tree_sha256=hashlib.sha256(ET.tostring(proxy, encoding="utf-8")).hexdigest())
+    metadata.set("collection-consistency", "multi-request-not-atomic")
+    metadata.set("collector-version", __version__)
+    print("  hierarchy: " + coverage["status"] + " (" + str(len(coverage["parents"])) + " assertions)")
+    return metadata
 
 
 def fetch_managed_devices(host, api_key, verify_ssl=True,
@@ -563,7 +613,7 @@ def fetch_managed_devices(host, api_key, verify_ssl=True,
 
 def build_export_root(dg_entries, tmpl_entries, stack_entries=None,
                       shared_elem=None, device_branches=None,
-                      top_branches=None, managed_devices=None):
+                      top_branches=None, managed_devices=None, hierarchy=None):
     """Assemble the round-trip-compatible <config> XML root.
 
     Shape mirrors what panorama_import.py consumes:
@@ -630,11 +680,16 @@ def build_export_root(dg_entries, tmpl_entries, stack_entries=None,
     if managed_devices is not None:
         config.append(managed_devices)
 
+    if hierarchy is not None:
+        config.append(deepcopy(hierarchy))
+    else:
+        preserve_hierarchy(config, source="per-entry-without-hierarchy", config_store="candidate")
+
     return config
 
 
 def audit_completeness(host, api_key, collected_top, collected_device,
-                       verify_ssl=True):
+                       verify_ssl=True, return_status=False):
     """Compare what we collected against what this Panorama actually has.
 
     This is the guard that makes the collector safe to point at a customer we
@@ -649,6 +704,7 @@ def audit_completeness(host, api_key, collected_top, collected_device,
     branch should produce a loud warning, not a broken collection.
     """
     missing_top, missing_device = [], []
+    status = "unverified"
 
     ok, _, root, _ = get_with_retry(
         host, api_key, "/config", verify_ssl,
@@ -657,8 +713,9 @@ def audit_completeness(host, api_key, collected_top, collected_device,
     if ok and root is not None:
         cfg = root.find("./result/config")
         if cfg is not None:
+            status = "verified"
             for child in cfg:
-                if child.tag in ("devices",):
+                if child.tag in ("devices", "readonly"):
                     continue
                 if child.tag in OPTIONAL_TOP_LEVEL:
                     continue  # opt-in by design, not an accidental omission
@@ -673,7 +730,8 @@ def audit_completeness(host, api_key, collected_top, collected_device,
                     if child.tag not in known:
                         missing_device.append(child.tag)
 
-    return missing_top, missing_device
+    result = (missing_top, missing_device)
+    return result + (status,) if return_status else result
 
 
 def write_xml_file(root_elem, output_path):
@@ -759,7 +817,7 @@ def main():
                         help="Pull the whole running config in ONE request "
                              "(type=export) instead of fetching each device "
                              "group and template separately. Far more robust on "
-                             "a slow or flaky link, and complete by construction. "
+                             "a slow or flaky link; hierarchy is validated before use. "
                              "Ignores --device-group/--template selection.")
     parser.add_argument("--no-audit", action="store_true",
                         help="Skip the completeness audit (which pulls the "
@@ -854,7 +912,7 @@ def main():
             print("ERROR: running-config fetch failed -- nothing written")
             print(f"{'=' * 60}")
             sys.exit(2)
-        removed = strip_branches(cfg, keep_mgt_config=args.include_mgt_config)
+        removed = strip_branches(cfg, keep_mgt_config=args.include_mgt_config, config_store="running")
         if removed:
             print(f"  stripped: {', '.join(sorted(set(removed)))}")
         if not args.no_managed_devices:
@@ -862,6 +920,12 @@ def main():
             md = fetch_managed_devices(args.panorama, api_key, verify_ssl)
             if md is not None:
                 cfg.append(md)
+        ET.SubElement(cfg, "nc-collection", {"schema": "nc.panorama-collection.v1",
+            "collector": "netconverter-palo", "version": __version__, "mode": "running-export",
+            "config-store": "running", "configuration-consistency": "single-config-response",
+            "completed-at": datetime.now(timezone.utc).isoformat(),
+            "hierarchy": hierarchy_coverage(cfg)["status"], "native-content": "full-entries",
+            "device-local-coverage": "not-collected"})
         try:
             write_xml_file(cfg, args.output)
         except OSError as e:
@@ -882,10 +946,12 @@ def main():
         sh = cfg.find("./shared")
         print(f"  shared:          {sum(len(c.findall('./entry')) for c in sh) if sh is not None else 0} objects")
         print(f"  branches:        {', '.join(c.tag for c in cfg)}")
-        print(f"  completeness:    COMPLETE BY CONSTRUCTION (whole tree in one call)")
+        ancestry = hierarchy_coverage(cfg)
+        print(f"  hierarchy:       {ancestry['status'].upper()}")
+        print("  capture:         single configuration export; device-local/operational completeness is not implied")
         print(f"  output:          {args.output} ({size_bytes:,} bytes)")
         print(f"{'=' * 60}")
-        return 0
+        return 0 if ancestry["complete"] else 3
 
     # ----- Resolve target lists -----
     if args.all_device_groups:
@@ -1044,6 +1110,7 @@ def main():
         sys.exit(2)
 
     print(f"\n--- Writing output XML ---")
+    hierarchy = fetch_hierarchy(args.panorama, api_key, verify_ssl)
     root_elem = build_export_root(
         dg_entries, tmpl_entries,
         stack_entries=stack_entries,
@@ -1051,6 +1118,7 @@ def main():
         device_branches=device_branches,
         top_branches=top_branches,
         managed_devices=managed_devices,
+        hierarchy=hierarchy,
     )
     try:
         write_xml_file(root_elem, args.output)
@@ -1087,7 +1155,7 @@ def main():
         print(f"  The snapshot on disk is PARTIAL. Re-run before using it for an")
         print(f"  engagement — a missing device group is missing policy.")
 
-    missing_top, missing_device = [], []
+    missing_top, missing_device, audit_status = [], [], "skipped"
     if args.no_audit:
         print(f"\n--- Completeness audit SKIPPED (--no-audit) ---")
     else:
@@ -1095,8 +1163,8 @@ def main():
         print(f"  (pulls the full /config tree to compare — slow on a large "
               f"Panorama; skip with --no-audit)")
         collected_top = set(top_branches) | ({"shared"} if shared_elem is not None else set())
-        missing_top, missing_device = audit_completeness(
-            args.panorama, api_key, collected_top, set(device_branches), verify_ssl
+        missing_top, missing_device, audit_status = audit_completeness(
+            args.panorama, api_key, collected_top, set(device_branches), verify_ssl, return_status=True
         )
     if missing_top or missing_device:
         print("  INCOMPLETE — branches present on this Panorama but NOT collected:")
@@ -1105,9 +1173,11 @@ def main():
         for b in missing_device:
             print(f"    /config/devices/entry/{b}")
         print("  This is a collector gap, not a customer difference. Report it.")
-    else:
+    elif audit_status == "verified":
         print("  COMPLETE — every branch present on this Panorama was collected")
         print("  (excluding opt-in: " + ", ".join(sorted(OPTIONAL_TOP_LEVEL)) + ")")
+    else:
+        print("  Branch completeness remains UNVERIFIED (audit " + audit_status + ")")
 
     # ----- Summary -----
     total_attempted = (overall["fetched"] + overall["skipped"]
@@ -1135,15 +1205,31 @@ def main():
               f"{', '.join(sorted(list(device_branches) + list(top_branches)))}")
     if managed_devices is not None:
         print(f"  managed devices: {len(managed_devices)} with hostname/model/HA")
-    _branch_ok = not (missing_top or missing_device)
-    _entries_ok = not (lost_dgs or lost_tmpls)
-    if _branch_ok and _entries_ok:
+    _branch_ok = audit_status == "verified" and not (missing_top or missing_device)
+    _entries_ok = include_children and not (lost_dgs or lost_tmpls)
+    ancestry = hierarchy_coverage(root_elem)
+    if _branch_ok and _entries_ok and ancestry["complete"]:
         _state = "COMPLETE"
+    elif not include_children:
+        _state = "INCOMPLETE — identity stubs only; native configuration was not requested"
     elif not _entries_ok:
         _state = (f"INCOMPLETE — {len(lost_dgs)} device-group(s) and "
                   f"{len(lost_tmpls)} template(s) FAILED to fetch")
     else:
-        _state = "INCOMPLETE — uncollected branches, see audit above"
+        _state = "INCOMPLETE / UNVERIFIED — hierarchy or branch evidence missing; see audit above"
+    provenance = ET.SubElement(root_elem, "nc-collection", {"schema": "nc.panorama-collection.v1",
+        "collector": "netconverter-palo", "version": __version__, "mode": "per-entry",
+        "config-store": "candidate", "configuration-consistency": "multi-request-not-atomic",
+        "completed-at": datetime.now(timezone.utc).isoformat(), "branch-audit": audit_status,
+        "entry-coverage": "captured" if _entries_ok else "partial", "hierarchy": ancestry["status"]})
+    provenance.set("native-content", "full-entries" if include_children else "stubs")
+    for kind, names in (("device-group", lost_dgs), ("template", lost_tmpls),
+                         ("top-branch", missing_top), ("device-branch", missing_device)):
+        for name in names:
+            ET.SubElement(provenance, "missing", {"kind": kind, "name": name})
+    # The first write preserved useful partial output if the audit failed.
+    # Persist its actual outcome instead of leaving completeness only in logs.
+    write_xml_file(root_elem, args.output)
     print(f"  completeness:    {_state}")
     print(f"  output:          {args.output} ({size_bytes:,} bytes)")
     if total_attempted > 0:
@@ -1152,7 +1238,7 @@ def main():
             print(f"  WARNING: failure rate {failure_rate:.0%} exceeds 20% threshold")
     print(f"{'=' * 60}")
 
-    if lost_dgs or lost_tmpls:
+    if not _entries_ok or missing_top or missing_device or not ancestry["complete"]:
         print(f"\nExiting 3: the snapshot is partial. This is deliberate — a")
         print(f"silently partial collection is how an engagement ships wrong data.")
         sys.exit(3)
@@ -1168,4 +1254,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

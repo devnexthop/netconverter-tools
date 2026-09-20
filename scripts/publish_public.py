@@ -269,15 +269,15 @@ def main() -> int:
         print("  render  collectors.lock.json")
         changed += 1
     if not args.dry_run:
-        lock_path.write_text(lock_text)
+        lock_path.write_text(lock_text, encoding="utf-8")
 
     readme = render_readme(target, folders)
     if (target / "README.md").read_text(encoding="utf-8") != readme:
         print("  render  README.md")
         changed += 1
     if not args.dry_run:
-        (target / "README.md").write_text(readme)
-        (target / "PUBLISHED.md").write_text(render_stamp(lock, source_commit()))
+        (target / "README.md").write_text(readme, encoding="utf-8")
+        (target / "PUBLISHED.md").write_text(render_stamp(lock, source_commit()), encoding="utf-8")
 
     print(f"\n{added} added, {changed} updated, {len(stale)} deleted"
           + (" (dry run -- nothing written)" if args.dry_run else ""))

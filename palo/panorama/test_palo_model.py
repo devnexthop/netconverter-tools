@@ -436,7 +436,7 @@ _FW_XML = """<config><panorama/>
   </rules></security></pre-rulebase>
 </shared>
 <devices><entry name="localhost.localdomain"><device-group>
-  <entry name="Parent">
+  <entry name="Parent"><parent-dg/>
     <pre-rulebase><security><rules>
       <entry name="parent-pre">
         <from><member>any</member></from><to><member>any</member></to>
@@ -551,13 +551,7 @@ _NOSSAMAN_XML = next(_NOSSAMAN_DIR.glob("*2125*running*.xml"), Path("/nonexisten
 
 
 def test_nossaman_firewall_view_twelve_boxes():
-    """Prove Firewall view on the 12-firewall Nossaman Panorama snapshot.
-
-    This running-config has no <parent-dg> tags (same as the HTML report from
-    yesterday — every DG parent is em-dash). Sibling-site hide is still the
-    product proof: opening AUS must not dump LV / Branch Offices local rules.
-    Parent-DG inheritance is covered by test_rule_target_and_firewall_view.
-    """
+    """A legacy stripped capture supports inventory, never proven flat policy."""
     if not _NOSSAMAN_XML.is_file():
         print("skip test_nossaman_firewall_view_twelve_boxes (XML not on this machine)")
         return
@@ -571,24 +565,17 @@ def test_nossaman_firewall_view_twelve_boxes():
     assert aus_serial in rows
     assert rows[aus_serial]["hostname"] == "AUS-PAFW-01"
     assert rows[aus_serial]["device_group"] == "AUS"
-    mine, other = model.split_rules_for_serial(model.rules, aus_serial, "AUS")
-    mine_names = {r["name"] for r in mine}
-    assert "SilverPeak_Inbound_Rule" in mine_names
-    assert "DomainstoAccessAIOpsforNGFW" in mine_names
-    lv_names = {r["name"] for r in model.rules if r.get("device_group") == "LV"}
-    bo_names = {r["name"] for r in model.rules if r.get("device_group") == "Branch Offices"}
-    assert not (mine_names & lv_names), f"AUS leaked LV rules: {mine_names & lv_names}"
-    assert not (mine_names & bo_names), f"AUS leaked Branch Offices rules: {mine_names & bo_names}"
-    # Targeted rule: only AUS serial; other=[] because AUS has one member.
-    targeted = next(r for r in model.rules if r["name"] == "SilverPeak_Inbound_Rule")
-    assert targeted["target_serials"] == [aus_serial]
-    assert other == []
+    assert not model.hierarchy_coverage["complete"]
+    assert all(row["available"] is False for row in rows.values())
+    assert all(row["applicable_rules"] is None and row["inherited_rules"] is None for row in rows.values())
+    assert model.optimization_findings() == []
+    try:
+        model.split_rules_for_serial(model.rules, aus_serial, "AUS")
+    except ValueError as exc:
+        assert "ancestry is unverified" in str(exc)
+    else:
+        raise AssertionError("Incomplete capture was presented as device policy")
 
-    # Two LV members share the untargeted 39-rule book.
-    lv = [r for r in rows.values() if r["device_group"] == "LV"]
-    assert len(lv) == 2
-    assert {r["applicable_rules"] for r in lv} == {39}
-    assert {r["inherited_rules"] for r in lv} == {39}
 
 
 if __name__ == "__main__":
@@ -610,3 +597,20 @@ if __name__ == "__main__":
         fn()
         print(f"ok {fn.__name__}")
     print(f"All {len(tests)} tests passed.")
+
+
+def test_nat_pool_dependencies_preserve_display_summary():
+    from palo_model import _nat_translation, _nat_translation_refs
+    entry = ET.fromstring('''<entry><source-translation><dynamic-ip-and-port>
+      <translated-address><member>pool-a</member><member>pool-b</member></translated-address>
+      </dynamic-ip-and-port></source-translation><destination-translation>
+      <translated-address>server</translated-address><translated-port>8443</translated-port>
+      </destination-translation></entry>''')
+    assert _nat_translation(entry, 'source-translation') == 'pool-a'
+    assert _nat_translation_refs(entry, 'source-translation') == ['pool-a', 'pool-b']
+    assert _nat_translation_refs(entry, 'destination-translation') == ['server']
+    for cls in (PaloStandaloneModel, PaloPanoramaModel):
+        model = cls(Path('unused.xml'))
+        row = model._parse_nat_rule(entry, 'scope', 'pre-rulebase')
+        assert row['source_translation_refs'] == ['pool-a', 'pool-b']
+        assert row['dest_translation_refs'] == ['server']

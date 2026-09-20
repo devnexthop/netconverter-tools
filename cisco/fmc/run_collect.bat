@@ -1,6 +1,9 @@
 @echo off
 REM Cisco FMC audit data collection - Windows helper (mirrors checkpoint\run_collect.bat)
 cd /d "%~dp0"
+chcp 65001 >nul
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
 
 echo Cisco FMC Audit Collector
 echo.

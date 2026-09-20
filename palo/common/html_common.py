@@ -47,6 +47,18 @@ def disabled_tag(disabled: bool) -> str:
 
 SHARED_SCOPE = "Shared"
 
+
+def ancestry_unavailable(model) -> bool:
+    return not getattr(model, "hierarchy_coverage", {"complete": True}).get("complete")
+
+
+ANCESTRY_NOTE = (
+    "<b>Unavailable: device-group ancestry is unverified.</b> This capture supports "
+    "read-only inventory. Complete device policy, unused-object analysis and "
+    "optimization require Palo collector 1.7.2 or a native full export retaining "
+    "readonly hierarchy. Do not combine hierarchy and policy from different capture dates."
+)
+
 # One wording for the whole report so no two pages imply different arithmetic.
 BASIS_DEFINITIONS = (
     "<b>Counting basis:</b> one row per object <b>definition</b> (device group + name), "
@@ -82,6 +94,8 @@ def yes_no_tag(value: str, *, good: str = "yes") -> str:
 def snapshot_gaps(model) -> list[str]:
     """Branches a pre-1.5.0 collector never fetched. Saying so beats blank cells."""
     gaps: list[str] = []
+    if ancestry_unavailable(model):
+        gaps.append(ANCESTRY_NOTE)
     if not getattr(model, "has_shared", True):
         gaps.append(
             "<b>No <code>&lt;shared&gt;</code> branch in this snapshot.</b> Panorama's shared "
@@ -716,7 +730,7 @@ def build_inventory_pages(site: SiteBuilder, model, *, panorama: bool) -> None:
     if panorama:
         unused_hdr = ["Device group / scope", "Category", "Name", "Definition"]
     unused_rows = []
-    for u in model.unused:
+    for u in ([] if ancestry_unavailable(model) else model.unused):
         if panorama:
             unused_rows.append(
                 f"<tr><td>{scope_cell(u.get('device_group', ''))}</td><td>{esc(u['category'])}</td>"
@@ -755,14 +769,11 @@ def build_inventory_pages(site: SiteBuilder, model, *, panorama: bool) -> None:
             "Objects not referenced by security or NAT rules in their scope "
             "(including expanded group membership)."
         )
-    table_page(
-        site,
-        "unused.html",
-        "Unused objects",
-        unused_hdr,
-        unused_rows,
-        note=unused_note,
-    )
+    if ancestry_unavailable(model):
+        site.page("unused.html", "Unused objects", '<h2>Unused objects unavailable</h2><div class="note warn">' + ANCESTRY_NOTE + '</div>')
+        site.page("optimization.html", "Optimization", '<h2>Optimization unavailable</h2><div class="note warn">' + ANCESTRY_NOTE + '</div>')
+        return
+    table_page(site, "unused.html", "Unused objects", unused_hdr, unused_rows, note=unused_note)
 
     opt_rows = []
     for f in model.optimization_findings():
@@ -1224,17 +1235,25 @@ def build_firewall_pages(site: SiteBuilder, model: "PaloPanoramaModel") -> None:
         serial = fw["serial"]
         rel = f"devices/{safe_name(serial)}.html"
         host = fw.get("hostname") or serial
+        security_count = f"{fw['applicable_rules']} / {fw['inherited_rules']}" if fw["available"] else "Unavailable"
+        nat_count = f"{fw['applicable_nat']} / {fw['inherited_nat']}" if fw["available"] else "Unavailable"
         index_rows.append(
             "<tr>"
             f"<td><a href='{rel}'>{esc(host)}</a></td>"
             f"<td class='mono'><a href='{rel}'>{esc(serial)}</a></td>"
             f"<td>{dg_cell(fw.get('device_group') or '')}</td>"
             f"<td>{stack_link(fw.get('template_stack') or '')}</td>"
-            f"<td>{fw.get('applicable_rules', 0)} / {fw.get('inherited_rules', 0)}</td>"
-            f"<td>{fw.get('applicable_nat', 0)} / {fw.get('inherited_nat', 0)}</td>"
+            f"<td>{security_count}</td>"
+            f"<td>{nat_count}</td>"
             f"<td>{esc(fw.get('model') or '—')}</td></tr>"
         )
         dg = fw.get("device_group") or ""
+        if not fw["available"]:
+            site.page(rel, host, '<p><a href="../firewalls.html">← Firewall view</a></p>'
+                + f'<h2>{esc(host)}</h2><p>Serial: {esc(serial)} · Device group: {esc(dg)}</p>'
+                + '<div class="note warn">' + esc(fw['unavailable_reason']) + '</div>'
+                + '<p>Device policy counts and tables are unavailable; the captured inventory remains available.</p>', depth=1)
+            continue
         sec_mine, sec_other = model.split_rules_for_serial(model.rules, serial, dg)
         nat_mine, nat_other = model.split_rules_for_serial(model.nat_rules, serial, dg)
         dec_mine, _dec_other = model.split_rules_for_serial(model.decrypt_rules, serial, dg)
@@ -1246,10 +1265,10 @@ def build_firewall_pages(site: SiteBuilder, model: "PaloPanoramaModel") -> None:
             f"<b>Device group</b>: {dg_cell(dg, prefix='../')} · "
             f"<b>Template stack</b>: {stack_link(fw.get('template_stack') or '', prefix='../')} · "
             f"<b>Model</b>: {esc(fw.get('model') or '—')}</div>",
-            '<div class="note">Rules below are this firewall\'s <b>effective</b> policy: '
+            '<div class="note">Rules below are this firewall\'s <b>captured inherited Panorama</b> policy: '
             "inherited parent-DG pre/post plus local rules, then filtered by rule "
             "<code>target</code> (empty target = every member of the device group). "
-            "Sibling device-group local rules are not shown.</div>",
+            "Sibling device-group local rules are not shown. Device-local overrides and live effective policy are not established by this capture.</div>",
         ]
         sec_hdr = ["Scope", "Rulebase", "Name", "From", "To", "Source", "Destination", "Application", "Service", "Action"]
         body.append(
@@ -1319,6 +1338,7 @@ def build_firewall_pages(site: SiteBuilder, model: "PaloPanoramaModel") -> None:
          "NAT (this / inherited)", "Model"],
         index_rows,
         note=(
+            (ANCESTRY_NOTE + "<br>" if ancestry_unavailable(model) else "") +
             "One row per managed firewall. <b>This / inherited</b> is rules that apply to "
             "that serial versus the full inherited device-group chain (parent pre/post + local). "
             "Sibling device-group local rules are excluded. Same idea as Check Point Firewall view "
@@ -1371,7 +1391,7 @@ def build_panorama_site(model: PaloPanoramaModel, out_dir: Path, *, viewer_versi
             (str(st.get("app_overrides", 0)), "App override", ""),
             (str(st.get("log_forwarding", 0)), "Log forwarding", ""),
             (str(st["zones"]), "Zones (templates)", ""),
-            (str(st["unused_objects"]), "Unused definitions", "warn" if st["unused_objects"] else ""),
+            ("Unavailable" if ancestry_unavailable(model) else str(st["unused_objects"]), "Unused definitions", "warn" if ancestry_unavailable(model) or st["unused_objects"] else ""),
             (str(st["rules_without_profiles"]), "Rules w/o profiles", "warn" if st["rules_without_profiles"] else ""),
         ]),
         "<h3>Shared namespace</h3>",
@@ -1415,8 +1435,8 @@ def build_panorama_site(model: PaloPanoramaModel, out_dir: Path, *, viewer_versi
     roots = model.suite_roots()
     panorama_body = [
         "<h2>Panorama View</h2>",
-        '<div class="note">Device-group hierarchy (parent → child). Click a group for local rules, NAT, and objects.</div>',
-        _render_dg_tree(model, roots),
+        '<div class="note">' + (ANCESTRY_NOTE if ancestry_unavailable(model) else 'Device-group hierarchy (parent → child). Click a group for local rules, NAT, and objects.') + '</div>',
+        ('<ul>' + ''.join('<li>' + dg_cell(name) + '</li>' for name in model.device_groups) + '</ul>') if ancestry_unavailable(model) else _render_dg_tree(model, roots),
     ]
     site.page("panorama.html", "Panorama View", "".join(panorama_body))
 
